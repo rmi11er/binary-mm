@@ -43,7 +43,7 @@ def test_checked_in_fixture_is_current_and_small():
 def test_ladder_has_calls_and_puts_and_details():
     src = FixtureSource(make_session(D))
     q, details = run(src.ladder(PRODUCTS["forecastex-spx"], D))
-    assert {x.right for x in q} == {"C", "P"} and len(q) == 2 * 61
+    assert {x.right for x in q} == {"C", "P"} and len(q) == 2 * len(src.session.products["forecastex-spx"].ladder_strikes)
     assert len(details) == len(q) and details[0]["lastTradeTime"] == "15:00:00"
     cme, _ = run(src.ladder(PRODUCTS["cme-gold"], D))
     assert {x.right for x in cme} == {"C", "P"}
@@ -83,7 +83,7 @@ def test_clock_selects_snapshot_and_expiry_disappears_after_fix():
     f1 = run(src.reference_future(spec, D, [], None))
     now[0] = fix + 60 * 10**9
     assert run(src.option_expiries(spec, f1)) == []  # expired
-    now[0] = fix - 3 * 3600 * 10**9
+    now[0] = fix - 4 * 3600 * 10**9
     with pytest.raises(SourceError):
         run(src.ladder(spec, D))  # before the first snapshot
 

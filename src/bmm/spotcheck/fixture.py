@@ -6,6 +6,9 @@ Designed so the report yields known verdicts on question date 2026-10-05:
   forecastex-gold  INVESTIGATE   same +-4c gaps, displayed size 3 (tiny)
   cme-gold         INVESTIGATE   same gaps, size 40, but the only option expiry is fix + 24h
                                  (every snapshot is expiry-mismatched)
+Snapshot grids follow the collector's cadence (5 min to fix-30m, then 1 min to fix+30m). The
+gold products start at fix-60m (11:30 CT) and the equity products at fix-210m (also 11:30 CT), so
+a single collector run started at 11:30 CT has data for every product at every slot.
 Gaps are measured against the same `analyze.fair_band` the report uses, so the designed gap is
 what the analysis sees. "Rich" means venue mid above fair on the upside and below fair on the
 downside (|gap| 4-5c; a +4c premium is impossible on a 0.97 downside digital). Every product has
@@ -38,7 +41,6 @@ from bmm.spotcheck.vol import black76_call
 
 MIN_NS = 60 * 1_000_000_000
 YEAR_NS = 365 * 86400 * 1_000_000_000
-OFFSETS_MIN = list(range(-60, -30, 5)) + list(range(-30, 31))  # 5-min then 1-min grid
 SKEW = 0.8  # vol(K) = vol0 - SKEW * ln(K / F), as in test_analyze
 CROSSED_AT_MIN, TRADES_AT_MIN = -24, (5, 12)
 SIZE_CENTER_VOLUME = 100.0
@@ -62,14 +64,15 @@ class _Params:
     mode: str  # "rich" | "fair"
     noise: float
     expiry_offset_min: int  # option expiry relative to fix
+    start_min: int = -60  # first snapshot relative to fix; chosen so one run covers all products
     fut_symbol_month: str = "202612"
 
 
 _P: dict[str, _Params] = {
-    "forecastex-spx": _Params(1001, 6500.0, 0.16, 3.0, 0.25, 1.0, 30, 5.0, 130.0, 0.05, "ES", 40,
-                              0.01, "rich", 0.002, 0),
-    "forecastex-ndx": _Params(1002, 23000.0, 0.22, 12.0, 0.25, 5.0, 30, 25.0, 500.0, 0.5, "NQ", 40,
-                              0.02, "fair", 0.01, 0),
+    "forecastex-spx": _Params(1001, 6500.0, 0.16, 3.0, 0.25, 1.0, 45, 5.0, 130.0, 0.05, "ES", 40,
+                              0.01, "rich", 0.002, 0, -210),
+    "forecastex-ndx": _Params(1002, 23000.0, 0.22, 12.0, 0.25, 5.0, 42, 25.0, 500.0, 0.5, "NQ", 40,
+                              0.02, "fair", 0.01, 0, -210),
     "forecastex-gold": _Params(1003, 4000.0, 0.18, 1.5, 0.1, 1.0, 30, 10.0, 150.0, 0.1, "OG", 3,
                                0.01, "rich", 0.002, 0),
     "cme-gold": _Params(1004, 4000.0, 0.18, 1.5, 0.1, 5.0, 20, 10.0, 200.0, 0.1, "ECGC", 40,
@@ -154,7 +157,8 @@ def _build_product(key: str, qd: date, seed: int, idx: int) -> ProductData:
 
     snaps: list[Snap] = []
     f_settle: float | None = None
-    for i, off in enumerate(OFFSETS_MIN):
+    offsets = list(range(p.start_min, -30, 5)) + list(range(-30, 31))  # 5-min then 1-min
+    for i, off in enumerate(offsets):
         ts = fix + off * MIN_NS
         if p.expiry_offset_min == 0 and ts >= fix:
             F = f_settle  # settled: the fix price is frozen
