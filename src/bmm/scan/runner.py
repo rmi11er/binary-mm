@@ -110,6 +110,8 @@ async def _market_rows(
     )
     trade_objs = [Trade(*r) for r in tr.select(cols).iter_rows()] if not tr.is_empty() else []
     reason = exclusion(meta, book, now)
+    pq = mid * (1 - mid) if mid is not None else 0.25  # fee/rebate coefficients scale with p(1-p)
+    no_tape = bool(cfg and cfg.raw.get("trades_aggressor") == "none")
     split = float(cfg.raw.get("side_split", 0.5)) if cfg else 0.5
     verified = bool(cfg.raw.get("coll_verified", False)) if cfg else False
     out["programs"].append({"ts_ns": now, **dataclasses.asdict(prog)})
@@ -137,7 +139,8 @@ async def _market_rows(
                 "fills_side_hr": fills_contracts_hr(trade_objs, s, mids, WINDOW_NS),
                 "markout_30m_side": m, "n_trades_side": n_side, "n_markout_side": n_mo,
                 "coll_side": eval_coll(str(expr), px), "coll_verified": verified,
-                "maker_fee": prog.maker_fee, "maker_rebate": prog.maker_rebate,
+                "maker_fee": prog.maker_fee * pq, "maker_rebate": prog.maker_rebate * pq,
+                "fills_lower_bound": no_tape,
                 "settle_source": meta.settle_source, "settle_ns": meta.settle_ns,
                 "reference_quality": meta.reference_quality, "excluded": reason,
             }

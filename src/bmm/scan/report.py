@@ -169,7 +169,7 @@ def build_report(
             coll=r["coll_side"],
             q=int(ad.qualifying_min(prog, side, book)),
             s_star_cf=ad.s_star_closed_form(prog, side, book, c),
-            c_lower_bound=lb,
+            c_lower_bound=lb or bool(r.get("fills_lower_bound")),
         )
         halves.append((h, r))
 

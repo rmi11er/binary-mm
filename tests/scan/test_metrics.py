@@ -131,3 +131,17 @@ def test_snapshot_skips_non_public_venue_and_counts_contracts(tmp_path, caplog):
     assert bid["fills_side_hr"] == pytest.approx(4.0 / 24)  # 24h window, contracts not trades
     assert bid["n_trades_side"] == 1 and bid["markout_30m_side"] is None
     assert {"programs", "trades", "books"} <= set(out)
+
+
+def test_snapshot_scales_fee_to_p1p_and_flags_no_tape(tmp_path):
+    from bmm.scan.config import VenueCfg
+
+    class Fee(Fake):
+        async def programs(self):
+            return [PROG.__class__(**{**PROG.__dict__, "maker_fee": 0.02, "maker_rebate": 0.0125})]
+
+    cfg = {"v": VenueCfg("v", {"trades_aggressor": "none"})}
+    rows = asyncio.run(snapshot_once([Fee("v")], NOW, cfgs=cfg, root=tmp_path))["snapshots"]
+    assert all(r["fills_lower_bound"] for r in rows)
+    assert rows[0]["maker_fee"] == pytest.approx(0.02 * 0.5 * 0.5)  # mid = 0.50
+    assert rows[0]["maker_rebate"] == pytest.approx(0.0125 * 0.25)

@@ -20,6 +20,7 @@ checked = "2026-10-04"
 note = "Liquidity Incentive Program Period ended 2026-09-30; no later ForecastEx filing or notice found in CFTC orgrules search or NTM list. Not confirmed absent."
 
 [venue.pm_us]
+max_markets = 100             # first /v1/incentives page only (pagination param undocumented)
 enabled = true
 skip_reason = ""
 program_source = "api"
@@ -61,12 +62,15 @@ settle_source_field = "description (free text in /v1/markets); settlementPriceCa
 settle_source_verified = false
 book_exposes_identity = false   # aggregated levels: px, qty only
 book_identity_source = "https://docs.polymarket.us/api-reference/markets/get-market-book.md"
+scoring_tick = 0.01           # ASSUMPTION: book levels step $0.01; scoring "tick" unit not published
+scoring_tick_verified = false
 price_tick = 0.001            # orderPriceMinTickSize observed in /v1/markets; not confirmed as the scoring 'tick'
 price_tick_verified = false
 venue_min = 1.0
 venue_min_verified = false
 
 [venue.kalshi]
+max_markets = 100
 enabled = true
 skip_reason = ""
 program_source = "api"
@@ -111,12 +115,15 @@ settle_source_field = "market.rules_primary / rules_secondary (free text names t
 settle_source_verified = false
 book_exposes_identity = false
 book_identity_source = "https://docs.kalshi.com/api-reference/market/get-market-orderbook.md"
+scoring_tick = 0.01           # ASSUMPTION: linear_cent grid; "ticks" in the discount is not defined on the help page
+scoring_tick_verified = false
 price_tick = 0.01
 price_tick_verified = true    # market.price_ranges step 0.0100 in fixture; markets may use other price_level_structure
 venue_min = 1.0
 venue_min_verified = false
 
 [venue.gemini]
+max_markets = 30              # programs per scan (each costs 1 event + 1 book + 1 trades call)
 enabled = true                # data is public; scoring curve is NOT exact, so expected_reward is an approximation until scoring_verified flips
 skip_reason = ""
 program_source = "api"
