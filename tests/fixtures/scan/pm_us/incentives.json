@@ -1,0 +1,68 @@
+{
+  "programs": [
+    {
+      "marketSlug": "aachc-cfb-2026-11-28-mostpasstds-arcman",
+      "timePeriods": [
+        {
+          "programId": "cfb_futures_20261001",
+          "programType": "liquidityProgram",
+          "start": "2026-10-02T00:00:00Z",
+          "rewardPool": 36,
+          "status": "active",
+          "discountFactor": 0.3,
+          "targetSize": 7500,
+          "period": "daily_event",
+          "createdAt": "2026-10-01T03:50:15Z"
+        }
+      ],
+      "instrumentState": "INSTRUMENT_STATE_OPEN",
+      "category": "SPR",
+      "subcategory": "FOOTBALL",
+      "eventStartTime": "2026-08-29T16:00:00.000Z",
+      "instrumentProduct": "aachc"
+    },
+    {
+      "marketSlug": "aachc-cfb-2026-11-28-mostpasstds-avejoh",
+      "timePeriods": [
+        {
+          "programId": "cfb_futures_20261001",
+          "programType": "liquidityProgram",
+          "start": "2026-10-02T00:00:00Z",
+          "rewardPool": 36,
+          "status": "active",
+          "discountFactor": 0.3,
+          "targetSize": 7500,
+          "period": "daily_event",
+          "createdAt": "2026-10-01T03:50:15Z"
+        }
+      ],
+      "instrumentState": "INSTRUMENT_STATE_OPEN",
+      "category": "SPR",
+      "subcategory": "FOOTBALL",
+      "eventStartTime": "2026-08-29T16:00:00.000Z",
+      "instrumentProduct": "aachc"
+    },
+    {
+      "marketSlug": "aachc-cfb-2026-11-28-mostpasstds-beabac",
+      "timePeriods": [
+        {
+          "programId": "cfb_futures_20261001",
+          "programType": "liquidityProgram",
+          "start": "2026-10-02T00:00:00Z",
+          "rewardPool": 36,
+          "status": "active",
+          "discountFactor": 0.3,
+          "targetSize": 7500,
+          "period": "daily_event",
+          "createdAt": "2026-10-01T03:50:15Z"
+        }
+      ],
+      "instrumentState": "INSTRUMENT_STATE_OPEN",
+      "category": "SPR",
+      "subcategory": "FOOTBALL",
+      "eventStartTime": "2026-08-29T16:00:00.000Z",
+      "instrumentProduct": "aachc"
+    }
+  ],
+  "nextPageToken": "eyJ0IjoxNzkxMTM3Nzc5NTA0Nzk3MTcyLCJzIjoiYWFjaGMtY2ZiLTIwMjYtMTEtMjgtbW9zdHJlY3Mtd3lheW91Iiwic3QiOjE3OTA4OTkyMDAwMDAwMDAwMDAsInIiOjM2LCJvYiI6ImNyZWF0ZWRfYXQiLCJvZCI6ImRlc2MifQ=="
+}

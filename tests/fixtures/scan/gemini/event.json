@@ -1,0 +1,88 @@
+{
+  "id": "287861",
+  "title": "Arizona vs New York G",
+  "slug": "arizona-vs-new-york-g",
+  "type": "categorical",
+  "category": "Sports",
+  "ticker": "NFL-2610041700-ARI-NYG-M",
+  "status": "active",
+  "createdAt": "2026-09-28T04:16:20.665Z",
+  "contracts": [
+    {
+      "id": "287861-705719",
+      "label": "New York G",
+      "description": {
+        "data": {},
+        "content": [
+          {
+            "data": {},
+            "marks": [],
+            "value": "This market resolves to Yes if New York G wins the Pro Football game\n between New York G and Arizona scheduled for October 4, 2026 at 1:00 PM ET. If the game ends in a draw/tie, the market will resolve according to 50/50 draw resolution rules. Otherwise, it resolves to No. The Underlying is the official result of the specified sporting event. Source Agencies, in order, are the league governing the event, ESPN, Fox Sports, and the broadcast partner of the event\n. If the Expiration Value cannot be determined on the Expiration Date (including because the event is cancelled or a team forfeits, withdraws, or is disqualified), the Exchange may determine payouts pursuant to the Market Outcome Review Process. View the [full rules](https://assets.gemini.com/predictions/terms_and_conditions/Terms_and_Conditions_NFL_Win-Loss_Class_cdc7c57c-50cf-441a-a038-ee46f781e57f.pdf)",
+            "nodeType": "text"
+          }
+        ],
+        "nodeType": "document"
+      },
+      "prices": {
+        "buy": {"yes": "0.63", "no": "0.4"},
+        "sell": {"yes": "0.6", "no": "0.37"},
+        "bestBid": "0.6",
+        "bestAsk": "0.63",
+        "lastTradePrice": "0.63"
+      },
+      "status": "active",
+      "createdAt": "2026-09-28T04:16:20.665Z",
+      "termsAndConditionsUrl": "https://assets.gemini.com/predictions/terms_and_conditions/Terms_and_Conditions_NFL_Win-Loss_Class_cdc7c57c-50cf-441a-a038-ee46f781e57f.pdf",
+      "ticker": "NYG",
+      "instrumentSymbol": "GEMI-NFL-2610041700-ARI-NYG-M-NYG",
+      "marketState": "open",
+      "abbreviatedName": "NYG",
+      "expiryDate": "2026-10-06T05:00:00.000Z",
+      "effectiveDate": "2026-10-04T05:00:00.000Z",
+      "sortOrder": 2,
+      "sportsSide": "home",
+      "isCombo": false,
+      "quantityIncrement": "0.01",
+      "quantityMinimum": "0.01",
+      "priceIncrement": "0.01",
+      "quoteAssetPrecision": 2,
+      "priceMinimum": "0.01"
+    },
+    {
+      "id": "287861-705718",
+      "label": "Arizona",
+      "prices": {
+        "buy": {"yes": "0.38", "no": "0.64"},
+        "sell": {"yes": "0.36", "no": "0.62"},
+        "bestBid": "0.36",
+        "bestAsk": "0.38",
+        "lastTradePrice": "0.38"
+      },
+      "status": "active",
+      "ticker": "ARI",
+      "instrumentSymbol": "GEMI-NFL-2610041700-ARI-NYG-M-ARI",
+      "marketState": "open",
+      "expiryDate": "2026-10-06T05:00:00.000Z",
+      "sortOrder": 1,
+      "sportsSide": "away",
+      "isCombo": false,
+      "quantityIncrement": "0.01",
+      "quantityMinimum": "0.01",
+      "priceIncrement": "0.01",
+      "quoteAssetPrecision": 2,
+      "priceMinimum": "0.01"
+    }
+  ],
+  "isLive": true,
+  "participants": [
+    {"id": "443", "name": "New York Giants", "abbreviation": "NYG", "side": "home"},
+    {"id": "454", "name": "Arizona Cardinals", "abbreviation": "ARI", "side": "away"}
+  ],
+  "description": "Arizona vs New York G",
+  "volume": "16464.3",
+  "volume24h": "9439.83",
+  "tags": ["Pro Football"],
+  "expiryDate": "2026-10-06T05:00:00.000Z",
+  "startTime": "2026-10-04T17:00:00.000Z",
+  "subcategory": {"id": 12, "slug": "sports_pro-football", "name": "Pro Football", "path": ["Sports", "Pro Football"]}
+}

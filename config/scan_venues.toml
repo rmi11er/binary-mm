@@ -1,0 +1,167 @@
+# Rewards scanner venue config (Task 1 research, accessed 2026-10-04).
+# Sources and status tags live in research/venue_facts.md ("Rewards programs (2026-10-04)").
+# Conventions:
+#   maker_fee / maker_rebate are COEFFICIENTS: per-contract $ = coeff * p * (1 - p).
+#   coll_bid / coll_ask are rules, not numbers: "p" = price per contract, "1-p" = 1 minus price, "1.00" = $1 per contract.
+#   *_verified = false means NOT confirmed from a primary source; treat the value as a placeholder.
+#   R_usd_hr normalisation (one place, scan/venues): see r_usd_hr_rule per venue.
+
+[hosts]
+allow = [
+  "gateway.polymarket.us",
+  "external-api.kalshi.com",
+  "api.gemini.com",
+]
+
+[forecastex]
+renewed_program = "unknown"   # yes | no | unknown
+source = "https://www.cftc.gov/filings/orgrules/rules08182618342.pdf"   # program terms (period 2026-09-01..2026-09-30); no renewal filing found
+checked = "2026-10-04"
+note = "Liquidity Incentive Program Period ended 2026-09-30; no later ForecastEx filing or notice found in CFTC orgrules search or NTM list. Not confirmed absent."
+
+[venue.pm_us]
+enabled = true
+skip_reason = ""
+program_source = "api"
+# Observed 2026-10-04: GET https://gateway.polymarket.us/v1/incentives returned 200 with no credentials.
+# Docs (docs.polymarket.us/api-reference/incentives/*) say API-key auth is required on api.polymarket.us. CONFLICT: if the gateway starts returning 401, adapter must raise VenueNotPublic.
+needs_auth = false
+needs_auth_verified = false
+needs_auth_source = "observed unauthenticated 200 (fixture tests/fixtures/scan/pm_us/incentives.json); docs say auth: https://docs.polymarket.us/api-reference/incentives/overview.md"
+program_endpoint = "https://gateway.polymarket.us/v1/incentives"
+book_endpoint = "https://gateway.polymarket.us/v1/markets/{slug}/book"
+bbo_endpoint = "https://gateway.polymarket.us/v1/markets/{slug}/bbo"
+trades_endpoint = ""          # no unauthenticated trade tape with aggressor side found
+trades_aggressor = "none"     # Time & Sales report has no side; WS trade stream needs auth
+# NOT quadratic: official formula is Score = discount^(ticks from best price) * size.
+scoring = "geometric_target"
+scoring_verified = true
+scoring_source = "https://docs.polymarket.us/incentives/liquidity.md"
+# Per-side independent unless the program has maxSpread, in which case both sides must qualify in a snapshot (else that second is forfeited).
+two_sided = false             # per program: true when maxSpread != null (none seen in current fixtures)
+two_sided_rule = "coupled_iff_max_spread_present"
+side_split = 0.5              # each side normalised to 1.0 per snapshot; how the pool is divided between sides is NOT stated
+side_split_verified = false
+side_split_source = "https://docs.polymarket.us/incentives/liquidity.md"
+pro_rata = true
+target_size_rule = "walk outward from best price until aggregate resting size on the side reaches targetSize; orders within count, beyond do not"
+reward_period_rule = "periods early|day_of|live|daily_event; daily_event = midnight-to-midnight ET; R_usd_hr = rewardPool / hours(end-start) (end null for open-ended: assume 24h for daily_event, verified=false)"
+r_usd_hr_verified = false
+# OPEN: whether rewardPool is per market or shared across all markets of the programId (rewards page says 'shared across the program's markets'; API puts rewardPool on each market row).
+pool_scope = "unknown"
+coll_bid = "p"
+coll_ask = "1.00"
+coll_verified = true
+coll_source = "https://docs.polymarket.us/market-structure/collateral-and-margin.md"
+maker_fee = 0.0
+maker_rebate = 0.0125         # theta = -0.0125 -> $0.0125 * p * (1-p) per contract at time of trade
+fee_verified = true
+fee_source = "https://docs.polymarket.us/fees.md"
+settle_source_field = "description (free text in /v1/markets); settlementPriceCalculationMethod in book stats; /v1/markets/{slug}/settlement has no source field"
+settle_source_verified = false
+book_exposes_identity = false   # aggregated levels: px, qty only
+book_identity_source = "https://docs.polymarket.us/api-reference/markets/get-market-book.md"
+price_tick = 0.001            # orderPriceMinTickSize observed in /v1/markets; not confirmed as the scoring 'tick'
+price_tick_verified = false
+venue_min = 1.0
+venue_min_verified = false
+
+[venue.kalshi]
+enabled = true
+skip_reason = ""
+program_source = "api"
+needs_auth = false
+needs_auth_verified = true
+needs_auth_source = "https://docs.kalshi.com/api-reference/incentive-programs/get-incentives.md (security none; also fetched unauthenticated 2026-10-04)"
+program_endpoint = "https://external-api.kalshi.com/trade-api/v2/incentive_programs"
+book_endpoint = "https://external-api.kalshi.com/trade-api/v2/markets/{ticker}/orderbook"
+trades_endpoint = "https://external-api.kalshi.com/trade-api/v2/markets/trades"
+trades_aggressor = "taker_outcome_side,taker_book_side"
+scoring = "geometric_target"
+scoring_verified = true
+scoring_source = "https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program"
+# Per bid on each side (yes bids, no bids; a no bid is a yes ask): score = discount^(ticks below Reference Price) * size, Reference Price = first level walking down from best bid where cumulative size >= target/5.
+# Only orders that help reach Target Size on their side score; normalised per side by sum of qualifying scores; snapshot score = share_yes + share_no (max 2.0).
+# Snapshot excluded unless BOTH sides have >= Target Size resting.
+two_sided = true
+two_sided_rule = "snapshot_excluded_unless_both_sides_meet_target_size"
+side_split = 0.5              # each side worth up to 1.0 of 2.0 per snapshot
+side_split_verified = true
+side_split_source = "https://help.kalshi.com/en/articles/13823851-liquidity-incentive-program"
+pro_rata = true
+target_size_rule = "target_size_fp (observed 1000; program range >100 and <20000); qualifying orders = those needed to reach target on the side"
+# CFTC filing (Jul 15 2026 update) summary read via a PDF-summarising proxy describes Reference Price as the best bid/ask midpoint, which CONFLICTS with the help page; help page used.
+reference_price_verified = false
+discount_tick_unit = "unknown"   # 'ticks' not defined on help page; market price_level_structure linear_cent suggests $0.01 but not confirmed
+discount_tick_verified = false
+discount_function = "discount_factor_bps/10000 ^ ticks"
+reward_period_rule = "R_usd_hr = (period_reward / 10000) / hours(end_date - start_date); period_reward is centi-cents (1e-4 USD); fixture 1000000 over 24h = $100 -> $4.1667/hr"
+r_usd_hr_verified = true
+r_usd_hr_source = "https://docs.kalshi.com/api-reference/incentive-programs/get-incentives.md; help page says $1-$1000 per market per day"
+coll_bid = "p"                # buying YES at p costs p
+coll_ask = "1-p"              # YES ask at p == NO bid at 1-p; costs 1-p
+coll_verified = false         # orderbook equivalence is documented; amount reserved for a resting order is not stated on any page read
+coll_source = "https://docs.kalshi.com/getting_started/orderbook_responses.md"
+maker_fee = 0.0               # makers pay nothing on most series; series with fee_type *_maker_fees charge a maker fee
+maker_rebate = 0.0
+fee_verified = false          # maker coefficient (0.0175) only seen in secondary summaries; fee schedule PDF returned HTTP 429
+fee_source = "https://docs.kalshi.com/api-reference/exchange/get-series-fee-changes.md (per-series fee_type); https://news.kalshi.com/p/makers-and-takers (older: resting orders exempt)"
+maker_fee_if_series_flagged = 0.0175   # [S] secondary only
+settle_source_field = "market.rules_primary / rules_secondary (free text names the source, e.g. IMF PortWatch); series settlement_sources not fetched"
+settle_source_verified = false
+book_exposes_identity = false
+book_identity_source = "https://docs.kalshi.com/api-reference/market/get-market-orderbook.md"
+price_tick = 0.01
+price_tick_verified = true    # market.price_ranges step 0.0100 in fixture; markets may use other price_level_structure
+venue_min = 1.0
+venue_min_verified = false
+
+[venue.gemini]
+enabled = true                # data is public; scoring curve is NOT exact, so expected_reward is an approximation until scoring_verified flips
+skip_reason = ""
+program_source = "api"
+needs_auth = false
+needs_auth_verified = true
+needs_auth_source = "https://developer.gemini.com/rest-api/prediction-markets/rewards/list-liquidity-rewards-events (public); .../get-liquidity-rewards-config (public); fetched unauthenticated 2026-10-04"
+program_endpoint = "https://api.gemini.com/v1/prediction-markets/liquidity-rewards/events"
+program_config_endpoint = "https://api.gemini.com/v1/prediction-markets/liquidity-rewards/config"
+events_endpoint = "https://api.gemini.com/v1/prediction-markets/events/{event_ticker}"
+book_endpoint = "https://api.gemini.com/v1/book/{instrumentSymbol}"
+trades_endpoint = "https://api.gemini.com/v1/trades/{instrumentSymbol}"
+trades_aggressor = "type"     # field 'type' buy|sell present; that it is the taker side on prediction instruments is NOT documented
+trades_aggressor_verified = false
+book_trades_source = "observed unauthenticated 200 on 2026-10-04 (fixtures); https://developer.gemini.com/trading/rest-api/market-data lists order book and trade list as market data"
+# Snapshot score = spread_weight * size * two_sided_multiplier, per-minute snapshots. spread_weight is a 'quadratic curve based on distance from the midpoint' (formula not published).
+scoring = "quadratic_spread_two_sided_bonus"
+scoring_verified = false
+scoring_source = "https://developer.gemini.com/prediction-markets/liquidity-rewards-program"
+two_sided = false             # not required: 1.5x multiplier applies at snapshots with a qualifying bid AND ask on the same contract
+two_sided_rule = "1.5x_multiplier_if_bid_and_ask_same_contract"
+two_sided_multiplier = 1.5
+side_split = 0.5
+side_split_verified = false
+pro_rata = true               # payout = pool * (maker daily score / total qualifying score); uptime >= 50% of eligible snapshots to qualify
+max_spread_cents = 10         # from config endpoint, from midpoint
+size_cap = 250                # per order (doc-stated), contracts
+min_size = 10                 # contracts
+# no target_size concept in the Gemini program (size cap 250 per order instead)
+reward_period_rule = "daily pool paid 17:30 ET; R_usd_hr = daily_pool_usd / 24 (day boundary not stated)"
+r_usd_hr_verified = false
+pool_scope = "per event or per contract type; each has its own daily pool (doc). API rows show pool_id/pool_event_count (category_default pool 400.00 across 848 events) - whether 400 is per event or shared is unconfirmed"
+pool_scope_verified = false
+coll_bid = "p"                # assumption NOT verified
+coll_ask = "unknown"
+coll_verified = false
+coll_source = ""
+maker_fee = 0.0175            # maker fee = 0.0175 * C * p(1-p)
+maker_rebate = 0.021          # 0.30 rebate rate * 0.07 taker rate; only for orders filled in $0.20-$0.80 on contracts listed after 2026-03-18; cap 5% of fill notional
+fee_verified = true
+fee_net_verified = false      # unclear whether an eligible order pays the maker fee AND gets the rebate, or the rebate replaces it
+fee_source = "https://www.gemini.com/fees/predictions ; https://developer.gemini.com/prediction-markets/maker-rebate-program"
+settle_source_field = "event.contracts[].description (free text 'Source Agencies, in order, are ...'); termsAndConditionsUrl"
+settle_source_verified = false
+book_exposes_identity = false   # price/amount/timestamp only
+price_tick = 0.01
+price_tick_verified = true      # contract priceIncrement 0.01 in event fixture
+venue_min = 0.01                # contract quantityMinimum; rewards min_size is 10
+venue_min_verified = true
