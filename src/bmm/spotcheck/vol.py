@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 from scipy.optimize import brentq
 
@@ -41,17 +42,51 @@ def implied_vol(F: float, K: float, T: float, price: float) -> float | None:
 
 
 def atm_sigma(chain: list[OptQuote], F: float, T: float) -> float | None:
-    """IV of the call mid at the strike nearest F."""
-    if not chain:
-        return None
-    q = min(chain, key=lambda c: abs(c.strike - F))
-    return implied_vol(F, q.strike, T, q.mid)
+    """IV of the call mid at the strike nearest F, skipping unusable quotes.
+
+    Quotes with bid <= 0, ask < bid or non-finite prices are ignored; if the nearest valid
+    strike has no solvable IV, the next-nearest is tried.
+    """
+    good = [
+        q
+        for q in chain
+        if math.isfinite(q.call_bid) and math.isfinite(q.call_ask)
+        and q.call_bid > 0 and q.call_ask >= q.call_bid
+    ]  # fmt: skip
+    for q in sorted(good, key=lambda c: abs(c.strike - F)):
+        iv = implied_vol(F, q.strike, T, q.mid)
+        if iv is not None:
+            return iv
+    return None
 
 
-def strike_window(F: float, sigma: float, T: float, n_sd: float = 4.0) -> tuple[float, float]:
+def strike_window(
+    F: float,
+    sigma: float,
+    T: float,
+    n_sd: float = 4.0,
+    ladder_strikes: Sequence[float] | None = None,
+    listed: Sequence[float] | None = None,
+) -> tuple[float, float]:
+    """F*exp(+-n_sd*sigma*sqrt(T)), widened to cover the venue ladder's strike range and, when
+    `listed` option strikes are given, extended one listed strike beyond each edge so every
+    ladder strike is bracketed by option strikes."""
     w = n_sd * sigma * math.sqrt(T)
-    return F * math.exp(-w), F * math.exp(w)
+    lo, hi = F * math.exp(-w), F * math.exp(w)
+    if ladder_strikes:
+        lo, hi = min(lo, min(ladder_strikes)), max(hi, max(ladder_strikes))
+    if listed:
+        below = [k for k in listed if k < lo]
+        above = [k for k in listed if k > hi]
+        lo = max(below) if below else lo
+        hi = min(above) if above else hi
+    return lo, hi
 
 
 def year_frac(from_ns: int, to_ns: int) -> float:
-    return max((to_ns - from_ns) / (365 * 86400 * 1e9), 1e-9)
+    """Calendar-year fraction. Within 1 s of zero clamps to 1e-9; a materially negative
+    interval (expiry already passed) raises ValueError."""
+    d = to_ns - from_ns
+    if d < -1_000_000_000:
+        raise ValueError(f"negative interval: {d / 1e9:.1f}s")
+    return max(d / (365 * 86400 * 1e9), 1e-9)
