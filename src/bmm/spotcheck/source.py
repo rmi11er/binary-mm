@@ -18,7 +18,7 @@ class SourceError(RuntimeError):
 @dataclass(frozen=True)
 class LadderQuote:
     strike: float
-    right: Literal["C", "P", "B"]  # "B" = CME both-sided
+    right: Literal["C", "P"]  # ForecastEx: YES=C, NO=P. CME: call book and put book
     quote: RawQuote
 
 
