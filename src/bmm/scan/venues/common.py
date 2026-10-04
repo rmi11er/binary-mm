@@ -14,13 +14,26 @@ from bmm.scan.models import Level, Program
 
 DOMAIN_KEYWORDS = {
     "metals": r"\b(gold|silver|copper|platinum|palladium)\b",
-    "energy": r"\b(oil|wti|brent|natgas|natural gas|gasoline|crude|hormuz)\b",
+    "energy": r"\b(oil|wti|brent|natgas|natural gas|gasoline|crude)\b",
     "rates": r"\b(fed|fomc|treasury|yield|sofr|rate cut|rate hike|cpi|inflation)\b",
     "fx": r"\b(eur|usd|jpy|gbp|fx|dollar|yen|euro)\b",
     "equity_index": r"\b(s&p|spx|nasdaq|ndx|dow|russell)\b",
     "crypto": r"\b(btc|eth|bitcoin|ether|solana|crypto)\b",
     "sports": r"\b(nfl|nba|mlb|nhl|cfb|ncaa|football|basketball|baseball|soccer|tennis|ufc)\b",
+    "geopolitics": (
+        r"\b(hormuz|strait|war|ceasefire|cease-fire|sanctions?|invasion|invade|missile|nato|ukraine"
+        r"|russia|iran|israel|gaza|taiwan|coup|embargo|blockade)\b"
+    ),
+    "politics": (
+        r"\b(election|president|presidential|senate|congress|governor|primary|nominee|trump|biden"
+        r"|vance|democrat|republican|vote|impeach|cabinet|mayor|parliament|prime minister)\b"
+    ),
 }
+HIGH_JUMP_CATS = {"politics", "geopolitics"}
+NEWS_DRIVEN = re.compile(
+    r"\b(announce|resign|indict|arrest|verdict|ruling|nominate|merger|acquire|bankrupt|default"
+    r"|mention|say|says|tweet|post)\b"
+)
 DOMAIN_CATS = {"metals", "energy", "rates", "fx", "equity_index"}
 
 
@@ -30,6 +43,13 @@ def classify(*texts: str | None) -> str:
         if re.search(pat, blob):
             return cat
     return "other"
+
+
+def jump_class(category: str, *texts: str | None) -> str:
+    """ "high" when resolution is news-driven (politics, geopolitics, announcements): the price can
+    gap to 0/1 on one headline. Everything else is "normal" and uses the empirical 1h tail."""
+    blob = " ".join(t for t in texts if t).lower()
+    return "high" if category in HIGH_JUMP_CATS or NEWS_DRIVEN.search(blob) else "normal"
 
 
 def reference_quality(category: str, venue_names_source: bool = False) -> str:

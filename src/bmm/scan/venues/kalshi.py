@@ -13,6 +13,7 @@ from bmm.scan.venues.common import (
     digest,
     geo_walk,
     iso_ns,
+    jump_class,
     levels_sorted,
     pro_rata,
     qualifying,
@@ -65,6 +66,7 @@ class Kalshi:
             market_id=market_id, title=m.get("title", market_id), category=cat, expiry_ns=exp,
             settle_source=(m.get("rules_primary") or "")[:200] or None, settle_ns=exp,
             reference_quality=reference_quality(cat), in_game=False,
+            jump_class=jump_class(cat, m.get("title"), market_id, m.get("rules_primary")),
         )  # fmt: skip
 
     async def book(self, market_id: str) -> Book:
@@ -74,18 +76,23 @@ class Kalshi:
         return Book(levels_sorted(yes, True), levels_sorted(no, False))
 
     async def trades(self, market_id: str, since_ns: int) -> list[Trade]:
-        d = await self.c.get_json(
-            f"{API}/markets/trades",
-            {"ticker": market_id, "min_ts": str(since_ns // 10**9), "limit": "1000"},
-        )
-        # taker_outcome_side "yes" = the taker bought YES (lifted the ask) -> "buy" in YES terms.
-        return [
-            Trade(
-                iso_ns(t["created_time"]) or 0, float(t["yes_price_dollars"]), float(t["count_fp"]),
-                "buy" if t.get("taker_outcome_side") == "yes" else "sell",
-            )
-            for t in d.get("trades", [])
-        ]  # fmt: skip
+        out: dict[str, Trade] = {}
+        cursor = ""
+        for _ in range(int(self.cfg.raw.get("trade_pages", 6))):
+            params = {"ticker": market_id, "min_ts": str(since_ns // 10**9), "limit": "1000"}
+            if cursor:
+                params["cursor"] = cursor
+            d = await self.c.get_json(f"{API}/markets/trades", params)
+            for t in d.get("trades", []):
+                # taker_outcome_side "yes" = the taker bought YES (lifted the ask) -> "buy".
+                out[t["trade_id"]] = Trade(
+                    iso_ns(t["created_time"]) or 0, float(t["yes_price_dollars"]),
+                    float(t["count_fp"]), "buy" if t.get("taker_outcome_side") == "yes" else "sell",
+                )  # fmt: skip
+            cursor = d.get("cursor") or ""
+            if not cursor or not d.get("trades"):
+                break
+        return sorted(out.values(), key=lambda t: t.ts_ns)
 
     def _levels(self, side: Side, book: Book) -> list[Level]:
         return book.bids if side == "bid" else book.asks

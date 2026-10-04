@@ -125,3 +125,31 @@ def test_alloc_units_are_per_day():
     assert a.reward_day == pytest.approx(24 * h.reward(a.s))
     assert a.cost_day == pytest.approx(24 * h.c * a.s)
     assert a.roc_day == pytest.approx((a.reward_day - a.cost_day) / (a.s * h.coll))
+
+
+def test_stress_per_market_cap_binds():
+    # stress 0.5/contract, bankroll 8000 -> 2% = 160 -> at most 320 contracts
+    h = H(reward=pr(1e6, 10.0), c=1e-9, coll=0.5, stress_per=0.5)
+    (a,) = allocate([h])
+    assert a.s == 320 and a.stress_loss == pytest.approx(160.0)
+
+
+def test_stress_total_cap_binds():
+    hs = [
+        H(key=f"m{i}:bid", market=f"m{i}", venue=f"v{i}", reward=pr(1e6, 10.0), c=1e-9, coll=0.1,
+          stress_per=1.0)
+        for i in range(10)
+    ]  # fmt: skip
+    out = allocate(hs)
+    assert sum(a.stress_loss for a in out) <= 800 + 1e-9  # 10% of 8000
+    assert max(a.stress_loss for a in out) <= 160 + 1e-9  # 2% of 8000
+    assert sum(a.stress_loss for a in out) == pytest.approx(800.0)  # and it is used up
+
+
+def test_two_sided_block_counts_both_sides_stress():
+    bid = H(key="m:bid", market="m", two_sided=True, reward=pr(10.0, 5.0), q=20, stress_per=4.0)
+    ask = H(key="m:ask", market="m", two_sided=True, reward=pr(10.0, 5.0), q=20, stress_per=4.0)
+    # block stress = 20*4 + 20*4 = 160 -> exactly at the 2% cap: funded, no growth
+    out = {a.key: a.s for a in allocate([bid, ask])}
+    assert out == {"m:bid": 20, "m:ask": 20}
+    assert allocate([bid, ask], bankroll=7000)[0].s == 0  # cap 140 < 160: block doesn't fit

@@ -27,12 +27,14 @@ class GetOnlyClient:
         self._c = httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=transport)
         self._gap, self._backoff, self._retries = min_interval_s, backoff_s, retries
         self._last: dict[str, float] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     async def _pace(self, host: str) -> None:
-        wait = self._last.get(host, 0.0) + self._gap - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last[host] = time.monotonic()
+        async with self._locks.setdefault(host, asyncio.Lock()):  # concurrent callers queue here
+            wait = self._last.get(host, 0.0) + self._gap - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last[host] = time.monotonic()
 
     async def get_json(self, url: str, params: dict[str, str] | None = None) -> JSON:
         host = urlparse(url).hostname or ""

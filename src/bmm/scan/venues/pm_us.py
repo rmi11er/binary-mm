@@ -14,6 +14,7 @@ from bmm.scan.venues.common import (
     digest,
     geo_walk,
     iso_ns,
+    jump_class,
     levels_sorted,
     pro_rata,
     qualifying,
@@ -58,12 +59,17 @@ class PmUs:
                         raw_hash=digest(tp),
                     )
                 )  # fmt: skip
-                cat = "sports" if row.get("category") == "SPR" else classify(slug)
+                cat = (
+                    "sports"
+                    if row.get("category") == "SPR"
+                    else classify(slug, row.get("subcategory"))
+                )
                 self._meta[slug] = MarketMeta(
                     market_id=slug, title=slug, category=cat, expiry_ns=None,
                     settle_source=None, settle_ns=None,
                     reference_quality=reference_quality(cat),
                     in_game=tp.get("period") == "live",
+                    jump_class=jump_class(cat, slug, row.get("subcategory")),
                 )  # fmt: skip
                 break
         return out
@@ -80,10 +86,35 @@ class PmUs:
         def px(rows: list[dict[str, Any]]) -> list[tuple[float, float]]:
             return [(float(r["px"]["value"]), float(r["qty"])) for r in rows]
 
+        stats = md.get("stats") or {}
+        st = stats.get("sharesTraded")
         return Book(
             levels_sorted(px(md.get("bids", [])), True),
             levels_sorted(px(md.get("offers", [])), False),
+            shares_traded=float(st) if st not in (None, "") else None,
+            opened_ns=iso_ns(stats.get("openSetTime")),
         )
+
+    async def price_history(
+        self, market_id: str
+    ) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+        """(5-minute points for 1 day, 3-hour points for 1 week) of book-derived mids. Display
+        prices: long = best ask, short = 1 - best bid, so mid = (long + 1 - short) / 2."""
+        base = f"{GW}/v1/price-history"
+
+        async def pts(interval: str, fidelity: str) -> list[tuple[int, float]]:
+            d = await self.c.get_json(
+                base, {"symbol": market_id, "fixedInterval": interval, "fidelity": fidelity}
+            )
+            return [
+                (
+                    int(h["timestamp"]) * 10**9,
+                    (float(h["longPrice"]) + 1.0 - float(h["shortPrice"])) / 2,
+                )
+                for h in d.get("history", [])
+            ]
+
+        return await pts("INTERVAL_1D", "5"), await pts("INTERVAL_1W", "180")
 
     async def trades(self, market_id: str, since_ns: int) -> list[Trade]:
         return []  # no public tape (Time & Sales needs a key; WS needs auth)

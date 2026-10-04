@@ -85,8 +85,9 @@ def test_kalshi_orderbook_and_scoring(fake_client):
     d, raw = a.scored_depth(p, "bid", b)
     assert d == pytest.approx(1000.0) and raw == pytest.approx(1255.65)
     trades = asyncio.run(a.trades(p.market_id, 0))
-    assert trades and trades[0].price == pytest.approx(0.89) and trades[0].aggressor == "buy"
-    assert trades[0].size == pytest.approx(5.57)
+    assert [t.ts_ns for t in trades] == sorted(t.ts_ns for t in trades)
+    assert any(t.price == pytest.approx(0.89) and t.aggressor == "buy" for t in trades)
+    assert any(t.size == pytest.approx(5.57) for t in trades)
 
 
 def test_kalshi_reference_price_shifts_discount(fake_client):
@@ -112,3 +113,45 @@ def test_gemini_scoring_and_pool(fake_client):
     assert a.expected_reward(p, 10, "bid", Book([], [])) == 0.0
     t = asyncio.run(a.trades(p.market_id, 0))
     assert t[0].aggressor == "buy" and t[0].price == pytest.approx(0.63)
+
+
+def test_kalshi_trades_paginate_and_dedupe(fake_client):
+    a = make("kalshi", fake_client)
+    one = asyncio.run(a.trades("KXHORMUZWEEKLY-26OCT04-T20", 0))
+    pages = [c for c in a.c.calls if "/markets/trades" in c[0]]
+    assert len(pages) == 6 and pages[1][1]["cursor"]  # follows the cursor up to trade_pages
+    assert len({(t.ts_ns, t.price, t.size) for t in one}) == len(
+        one
+    )  # same page x6 -> deduped by id
+
+
+def test_pm_us_book_exposes_shares_traded_and_price_history(fake_client):
+    a = make("pm_us", fake_client)
+    b = asyncio.run(a.book("aachc-cfb-2026-11-28-mostpasstds-arcman"))
+    assert b.shares_traded == pytest.approx(5090.92) and b.opened_ns
+    fine, coarse = asyncio.run(a.price_history("aachc-cfb-2026-11-28-mostrecs-camcole"))
+    assert len(fine) == 40 and len(coarse) == 20
+    assert fine[0][1] == pytest.approx((0.01 + 1 - 0.99) / 2)  # (ask + bid) / 2
+    assert [t for t, _ in fine] == sorted(t for t, _ in fine)
+
+
+@pytest.mark.parametrize(
+    ("texts", "cat", "jump"),
+    [
+        (
+            ("Will there be more than 20 transit calls through the Strait of Hormuz",),
+            "geopolitics",
+            "high",
+        ),
+        (("Will Brent crude close above $90",), "energy", "normal"),
+        (("Will Trump sign the bill",), "politics", "high"),
+        (("Will gold close above 3000",), "metals", "normal"),
+        (("Highest temperature in Miami today",), "other", "normal"),
+        (("Will the Fed announce a rate cut",), "rates", "high"),  # news-driven wording
+    ],
+)
+def test_taxonomy_and_jump_class(texts, cat, jump):
+    from bmm.scan.venues.common import classify, jump_class
+
+    got = classify(*texts)
+    assert got == cat and jump_class(got, *texts) == jump

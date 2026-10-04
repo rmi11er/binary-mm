@@ -9,6 +9,12 @@ FIX = Path(__file__).resolve().parents[1] / "fixtures/scan"
 
 ROUTES = {  # (substring of url, fixture) in match order
     "pm_us": [
+        (
+            "/price-history",
+            lambda params: (
+                f"pm_us/price_history_{'1d' if params['fixedInterval'] == 'INTERVAL_1D' else '1w'}.json"
+            ),
+        ),
         ("/book", "pm_us/book_active.json"),
         ("/incentives", "pm_us/incentives.json"),
     ],
@@ -38,6 +44,7 @@ class FakeClient:
             raise VenueNotPublic(f"HTTP {self.status}")
         for sub, fx in ROUTES[self.venue]:
             if sub in url:
+                fx = fx(params) if callable(fx) else fx
                 return json.loads((FIX / fx).read_text())
         raise AssertionError(f"unrouted url {url}")
 

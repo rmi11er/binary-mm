@@ -14,6 +14,7 @@ from bmm.scan.venues.common import (
     classify,
     digest,
     iso_ns,
+    jump_class,
     levels_sorted,
     pro_rata,
     qualifying,
@@ -80,6 +81,7 @@ class Gemini:
                     expiry_ns=iso_ns(c.get("expiryDate")), settle_source=c.get("termsAndConditionsUrl"),
                     settle_ns=iso_ns(c.get("expiryDate")), reference_quality=reference_quality(cat),
                     in_game=str(e.get("isLive")).lower() == "true",
+                    jump_class=jump_class(cat, ev.get("title"), c.get("label")),
                 )  # fmt: skip
         return list(out.values())[:cap]
 

@@ -43,6 +43,8 @@ class Level:
 class Book:
     bids: list[Level]  # best (highest) first
     asks: list[Level]  # best (lowest) first
+    shares_traded: float | None = None  # cumulative contracts traded, where the venue exposes it
+    opened_ns: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class MarketMeta:
     settle_ns: int | None
     reference_quality: str  # venue_ref | model_needed | none
     in_game: bool
+    jump_class: str = "normal"  # high = news-driven resolution; see venues/common.jump_class
 
 
 class VenueAdapter(Protocol):

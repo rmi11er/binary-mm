@@ -129,3 +129,94 @@ def eval_coll(expr: str | None, p: float) -> float:
         raise ValueError(f"unsupported collateral expression: {expr!r}")
 
     return ev(ast.parse(expr, mode="eval"))
+
+
+# --- proxied (backfilled / derived) quantities. Everything below feeds fields flagged `proxied`. ---
+STEP_NS = 5 * 60 * 10**9
+
+
+def resample_trades(trades: list[Trade], step_ns: int = STEP_NS) -> list[tuple[int, float]]:
+    """Last trade price per 5-minute bucket, forward-filled: a mid proxy for venues with only a tape."""
+    if not trades:
+        return []
+    ts = sorted(trades, key=lambda t: t.ts_ns)
+    out: list[tuple[int, float]] = []
+    i, px = 0, ts[0].price
+    for b in range(ts[0].ts_ns // step_ns, ts[-1].ts_ns // step_ns + 1):
+        while i < len(ts) and ts[i].ts_ns // step_ns <= b:
+            px = ts[i].price
+            i += 1
+        out.append((b * step_ns, px))
+    return out
+
+
+def _moves(series: list[tuple[int, float]], lag_ns: int, tol_ns: int) -> list[float]:
+    if len(series) < 2:
+        return []
+    s = sorted(series)
+    tss, vals = [t for t, _ in s], [v for _, v in s]
+    out = []
+    for t, v in s:
+        if t + lag_ns > tss[-1]:
+            break
+        later = _asof(t + lag_ns, tss, vals, tol_ns)
+        if later is not None:
+            out.append(abs(later - v))
+    return out
+
+
+def mean_abs_move(
+    series: list[tuple[int, float]], lag_ns: int, tol_ns: int = 10 * 60 * 10**9
+) -> tuple[float | None, int]:
+    """Mean |mid(t + lag) - mid(t)| over the series; (None, 0) when no pair exists."""
+    m = _moves(series, lag_ns, tol_ns)
+    return (sum(m) / len(m), len(m)) if m else (None, 0)
+
+
+def tail_move_1h(fine: list[tuple[int, float]], coarse: list[tuple[int, float]]) -> float | None:
+    """Empirical 99th percentile of |1h mid move|. `fine` is a ~5-minute series (1h lag);
+    `coarse` is a 3-hour series whose 3h moves are scaled by 1/sqrt(3). Takes the larger."""
+    import numpy as np
+
+    h = 3600 * 10**9
+    cands: list[float] = []
+    f = _moves(fine, h, 10 * 60 * 10**9)
+    if len(f) >= 20:
+        cands.append(float(np.percentile(f, 99)))
+    c = _moves(coarse, 3 * h, 90 * 60 * 10**9)
+    if len(c) >= 10:
+        cands.append(float(np.percentile(c, 99)) / 3**0.5)
+    return max(cands) if cands else None
+
+
+def calibrate_lambda(rows: list[tuple[float, float, float]]) -> float | None:
+    """lambda = sum(n|markout|) / sum(n * mean|30m move|) over (n, markout, move) rows from venues
+    with a tape, clamped to [0.05, 1]. Converts a tape-less venue's 30m mid movement to a markout."""
+    num = sum(n * abs(m) for n, m, _ in rows)
+    den = sum(n * v for n, _, v in rows)
+    return None if den <= 0 else min(1.0, max(0.05, num / den))
+
+
+def adverse_jump(side: Side, price: float, jump_class: str, p99: float | None) -> float:
+    """Adverse price jump per contract: a bid loses if the price gaps toward 0, an ask toward 1.
+    jump_class high -> the full distance; otherwise the empirical 1h tail capped at that distance."""
+    dist = min(1.0, max(0.0, price if side == "bid" else 1.0 - price))
+    if jump_class == "high" or p99 is None:
+        return dist
+    return min(p99, dist)
+
+
+def fills_from_shares(
+    cur_shares: float, cur_ts: int, opened_ns: int | None, prev: tuple[int, float] | None
+) -> float | None:
+    """Total contracts/hr traded from cumulative sharesTraded: delta vs an earlier snapshot when it
+    is at least an hour old, else the lifetime average since the market opened."""
+    life = None
+    if opened_ns is not None and cur_ts > opened_ns:
+        life = cur_shares / max(1.0, (cur_ts - opened_ns) / H_NS)
+    if prev is not None:
+        pts, psh = prev
+        gap = (cur_ts - pts) / H_NS
+        if gap >= 1.0 and cur_shares >= psh:
+            return (cur_shares - psh) / gap
+    return life

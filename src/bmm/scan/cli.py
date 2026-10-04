@@ -17,13 +17,15 @@ def main(argv: list[str]) -> int:
     r.add_argument("--once", action="store_true")
     r.add_argument("--interval", type=int, default=300)
     r.add_argument("--venues", default="pm_us,kalshi,gemini")
+    r.add_argument("--full", action="store_true", help="force the hourly (full) tier")
+    r.add_argument("--top", type=int, default=40, help="markets per fast-tier scan")
     rep = sub.add_parser("report")
     rep.add_argument("--date", default=None)
     args = ap.parse_args(argv)
     if args.cmd == "rewards":
         from bmm.scan.runner import run
 
-        return run(args.venues.split(","), args.once, args.interval)
+        return run(args.venues.split(","), args.once, args.interval, args.full, args.top)
     from bmm.scan.report import write_report
 
     return write_report(args.date)
