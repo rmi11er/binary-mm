@@ -110,6 +110,21 @@ def test_product_failure_isolated(tmp_path):
     assert "forecastex-gold" not in set(lad["product"])
 
 
+def test_unexpected_exception_isolated(tmp_path):
+    for exc in (ValueError("bad"), KeyError("k"), IndexError("i"), AttributeError("a")):
+        _, status = go(lambda s, e=exc: FailGold(s, e), tmp=tmp_path / type(exc).__name__)
+        assert "dropped" in status["forecastex-gold"], exc
+        assert type(exc).__name__ in status["forecastex-gold"]
+        assert [status[k] for k in ("forecastex-spx", "forecastex-ndx", "cme-gold")] == ["ok"] * 3
+
+
+def test_safety_error_not_swallowed(tmp_path):
+    from bmm.spotcheck.safety import SafetyError
+
+    with pytest.raises(SafetyError):
+        go(lambda s: FailGold(s, SafetyError("non-paper")), tmp=tmp_path)
+
+
 def test_connection_and_timeout_errors_are_isolated(tmp_path):
     for exc in (ConnectionError("gw down"), TimeoutError("slow")):
         _, status = go(lambda s, e=exc: FailGold(s, e), tmp=tmp_path / type(exc).__name__)

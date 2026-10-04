@@ -51,3 +51,11 @@ def check_accounts(accounts: Iterable[str]) -> list[str]:
             f"(expected prefix {PAPER_ACCOUNT_PREFIX!r})"
         )
     return accts
+
+
+def check_client_id(client_id: int) -> int:
+    """clientId 0 is the master API client: ib_async then calls reqAutoOpenOrders(True) and binds
+    manually placed orders. Require a plain positive int so that path is never taken."""
+    if type(client_id) is not int or client_id <= 0:
+        raise SafetyError(f"spotcheck refuses client id {client_id!r}; must be an int > 0")
+    return client_id

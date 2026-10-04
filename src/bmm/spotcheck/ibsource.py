@@ -9,12 +9,13 @@ and on its client, before the socket is opened.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import date, timedelta
 from typing import Any
 
-from ib_async import IB, Contract, Future, FuturesOption
+from ib_async import IB, Contract, Future, FuturesOption, StartupFetch
 
 from bmm.clock import now_ns, ns_to_ct
 from bmm.spotcheck.analyze import OptQuote
@@ -26,7 +27,14 @@ from bmm.spotcheck.contracts import (
     parse_gc_month,
 )
 from bmm.spotcheck.normalise import RawQuote, raw_quote
-from bmm.spotcheck.safety import SafetyError, check_accounts, check_host, check_port
+from bmm.spotcheck.safety import (
+    SafetyError,
+    check_accounts,
+    check_client_id,
+    check_host,
+    check_mode,
+    check_port,
+)
 from bmm.spotcheck.source import FutQuote, LadderQuote, SourceError
 
 # Lower-case on purpose: matched case-insensitively against dir(ib) / dir(ib.client).
@@ -50,7 +58,7 @@ def disarm(ib: Any) -> list[str]:
     for label, obj in (("ib", ib), ("client", ib.client)):
         for name in dir(obj):
             if _ARMED.search(name):
-                obj.__dict__[name] = _stub(f"{label}.{name}")  # instance dict shadows the class
+                object.__setattr__(obj, name, _stub(f"{label}.{name}"))  # shadows the class method
                 done.append(f"{label}.{name}")
     return done
 
@@ -93,12 +101,18 @@ class IBSource:
         ib_factory: Callable[[], Any] = IB,
         allow_hosts: Iterable[str] = (),
     ) -> IBSource:
+        check_mode(os.environ)
         check_port(port)  # before anything is constructed or opened
+        check_client_id(client_id)
         check_host(host, allow_hosts)
         ib = ib_factory()
         disarm(ib)
         try:
-            await ib.connectAsync(host, port, clientId=client_id, readonly=True)
+            # StartupFetch(0): skip the default positions/executions/account-update pulls, which run
+            # before the paper-account check below.
+            await ib.connectAsync(
+                host, port, clientId=client_id, readonly=True, fetchFields=StartupFetch(0)
+            )
             check_accounts(ib.managedAccounts())
         except BaseException:
             ib.disconnect()

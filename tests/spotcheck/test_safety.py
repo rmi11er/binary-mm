@@ -12,6 +12,7 @@ from bmm.spotcheck.safety import (
     ALLOWED_PORTS,
     SafetyError,
     check_accounts,
+    check_client_id,
     check_host,
     check_mode,
     check_port,
@@ -26,7 +27,9 @@ FORBIDDEN = re.compile(
 ORDER_ATTRS = {
     "placeOrder", "cancelOrder", "reqGlobalCancel", "whatIfOrder", "whatIfOrderAsync",
     "bracketOrder", "oneCancelsAll", "exerciseOptions", "reqAutoOpenOrders", "reqOpenOrders",
+    "send", "sendMsg", "__dict__", "attrgetter",
 }  # fmt: skip
+ORDER_CALLS = {"__import__", "import_module", "vars", "attrgetter"}
 BAD_MODULES = (
     "bmm.gateway", "bmm.quoter", "bmm.hedger", "bmm.risk", "bmm.pricing.quoting", "ib_async.order",
 )  # fmt: skip
@@ -69,6 +72,16 @@ def test_remote_hosts_refused_unless_allowlisted(host):
         assert check_host(host, allow=[host]) == host
 
 
+@pytest.mark.parametrize("cid", [0, -3, 1.0, True, None, "7"])
+def test_refuses_bad_client_ids(cid):
+    with pytest.raises(SafetyError):
+        check_client_id(cid)
+
+
+def test_allows_positive_client_id():
+    assert check_client_id(31) == 31
+
+
 def test_accounts_must_be_paper():
     assert check_accounts(["DU123", "DU456"]) == ["DU123", "DU456"]
     for bad in ([], ["U123"], ["DU1", "U2"], ["du1"]):
@@ -109,7 +122,7 @@ def scan(paths):
             elif isinstance(node, ast.Attribute) and node.attr in ORDER_ATTRS:
                 hits.append(f"{where}:attr {node.attr}")
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in {"__import__", "import_module"}:
+                if node.func.id in ORDER_CALLS:
                     hits.append(f"{where}:dynamic import")
                 if node.func.id in {"getattr", "setattr", "eval", "exec"}:
                     lit = len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
@@ -151,6 +164,12 @@ EVASIONS = {
     "quoting": "from bmm.pricing.quoting import to_forecastex_orders",
     "pricing_pkg": "from bmm.pricing import black76_call",
     "attr_whatif": "ib.client.whatIfOrderAsync",
+    "client_send": "ib.client.send(1, 2)",
+    "client_sendmsg": "ib.client.sendMsg(b'x')",
+    "dunder_dict": "ib.__dict__['plac' + 'eOrder']",
+    "vars_call": "vars(ib)['x']",
+    "attrgetter_call": "f = attrgetter('placeOrder')",
+    "operator_attrgetter": "import operator\nf = operator.attrgetter('x')",
 }
 
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 from typing import ClassVar
 
 import pytest
-from ib_async import IB, Contract, ContractDetails
+from ib_async import IB, Contract, ContractDetails, StartupFetch
 
 from bmm.spotcheck.contracts import PRODUCTS, OptExpiry
 from bmm.spotcheck.ibsource import IBSource, disarm
@@ -54,8 +54,9 @@ class FakeIB:
     def whatIfOrder(self, *a): ...
     def bracketOrder(self, *a): ...
 
-    async def connectAsync(self, host, port, clientId, readonly):
+    async def connectAsync(self, host, port, clientId, readonly, fetchFields=None):
         self.calls.append(("connectAsync", host, port, clientId, readonly))
+        self.calls.append(("fetchFields", fetchFields))
 
     def managedAccounts(self):
         return self.accounts
@@ -125,6 +126,32 @@ def test_connect_is_readonly_on_4002():
     assert ("connectAsync", "127.0.0.1", 4002, 7, True) in made[0].calls
 
 
+def test_connect_skips_startup_fetch():
+    made = []
+
+    def factory():
+        made.append(FakeIB())
+        return made[-1]
+
+    run(IBSource.connect("127.0.0.1", 4002, 7, ib_factory=factory))
+    (ff,) = [c[1] for c in made[0].calls if c[0] == "fetchFields"]
+    assert isinstance(ff, StartupFetch) and ff == StartupFetch(0)
+
+
+@pytest.mark.parametrize("cid", [0, -1, 1.0, True, None])
+def test_bad_client_id_refused_before_ib_is_built(cid):
+    with pytest.raises(SafetyError):
+        run(IBSource.connect("127.0.0.1", 4002, cid, ib_factory=FakeIB))
+    assert FakeIB.instances == 0
+
+
+def test_live_mode_refused_before_ib_is_built(monkeypatch):
+    monkeypatch.setenv("BMM_MODE", "live")
+    with pytest.raises(SafetyError):
+        run(IBSource.connect("127.0.0.1", 4002, 7, ib_factory=FakeIB))
+    assert FakeIB.instances == 0
+
+
 def test_non_paper_account_disconnects_and_raises():
     made = []
 
@@ -139,6 +166,13 @@ def test_non_paper_account_disconnects_and_raises():
     assert ("disconnect",) in made[0].calls
 
 
+ALLOWED_IB_NAMES = {
+    "calls", "ticker_batches", "accounts", "details_by_type", "ticker_fn", "client",
+    "connectAsync", "managedAccounts", "disconnect", "reqContractDetailsAsync",
+    "reqTickersAsync", "qualifyContractsAsync", "reqSecDefOptParamsAsync",
+}  # fmt: skip
+
+
 def test_no_order_names_touched_on_normal_flow():
     ib = FakeIB()
     ib.details_by_type["OPT"] = [cd(6500.0, "C"), cd(6500.0, "P")]
@@ -146,10 +180,7 @@ def test_no_order_names_touched_on_normal_flow():
     run(s.ladder(PRODUCTS["forecastex-spx"], QD))
     run(s.close())
     assert not [n for n in FakeIB.log if re.search("order", n, re.IGNORECASE)], FakeIB.log
-    allowed = {"calls", "ticker_batches", "accounts", "details_by_type", "ticker_fn", "client",
-               "connectAsync", "managedAccounts", "disconnect", "reqContractDetailsAsync",
-               "reqTickersAsync", "qualifyContractsAsync", "reqSecDefOptParamsAsync"}
-    assert set(FakeIB.log) <= allowed, set(FakeIB.log) - allowed
+    assert set(FakeIB.log) <= ALLOWED_IB_NAMES, set(FakeIB.log) - ALLOWED_IB_NAMES
 
 
 # --- order stubs -------------------------------------------------------------------------------
@@ -282,3 +313,21 @@ def test_expiries_strikes_and_calls(monkeypatch):
     assert run(s.listed_strikes(spec, exps[0])) == [6500.0, 6510.0, 6520.0]
     qs = run(s.calls(spec, exps[0], [6500.0, 6510.0]))
     assert [q.strike for q in qs] == [6500.0, 6510.0] and qs[0].call_ask == 0.5
+    assert not [n for n in FakeIB.log if re.search("order", n, re.IGNORECASE)], FakeIB.log
+    assert set(FakeIB.log) <= ALLOWED_IB_NAMES, set(FakeIB.log) - ALLOWED_IB_NAMES
+
+
+def test_reference_future_touches_only_allowed_names(monkeypatch):
+    from bmm.clock import ct_to_ns
+
+    monkeypatch.setattr("bmm.spotcheck.ibsource.now_ns", lambda: ct_to_ns(QD, 9, 0))
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [cd(0.0, "", sec="FUT", under=0)]
+    s = src(ib)
+    spec = PRODUCTS["forecastex-spx"]
+    try:
+        run(s.reference_future(spec, QD, [], None))
+    except SourceError:
+        pass  # the probe is about which ib names are touched, not about resolution
+    assert not [n for n in FakeIB.log if re.search("order", n, re.IGNORECASE)], FakeIB.log
+    assert set(FakeIB.log) <= ALLOWED_IB_NAMES, set(FakeIB.log) - ALLOWED_IB_NAMES

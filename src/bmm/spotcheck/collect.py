@@ -23,6 +23,7 @@ from bmm.spotcheck.normalise import (
     cme_row,
     forecastex_row,
 )
+from bmm.spotcheck.safety import SafetyError
 from bmm.spotcheck.schema import ParquetSink
 from bmm.spotcheck.source import MarketDataSource, SourceError
 from bmm.spotcheck.vol import atm_sigma, strike_window, year_frac
@@ -219,10 +220,16 @@ async def collect(
                     source, specs[k], question_date, sink, f"{k}-{ts}", ts, gc_month,
                     write_details=oks[k] == 0, log=log,
                 )  # fmt: skip
-            except CAUGHT as e:
+            except SafetyError:
+                raise  # never swallowed: it ends the session
+            except Exception as e:  # one product's bug must not stop the others
                 fails[k] += 1
+                expected = isinstance(e, CAUGHT)
                 last_err[k] = f"{type(e).__name__}: {e}"
-                log.warning("product snapshot failed", product=k, error=last_err[k], n=fails[k])
+                log.warning(
+                    "product snapshot failed", product=k, error=last_err[k], n=fails[k],
+                    exc_info=not expected,
+                )  # fmt: skip
                 if fails[k] >= MAX_CONSECUTIVE_FAILURES:
                     active.discard(k)
                     log.error("product dropped for session", product=k)

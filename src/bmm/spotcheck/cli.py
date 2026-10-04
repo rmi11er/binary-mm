@@ -15,7 +15,7 @@ from pathlib import Path
 
 from bmm.clock import now_ns, ns_to_ct
 from bmm.spotcheck.contracts import PRODUCTS, ProductSpec, load_products
-from bmm.spotcheck.safety import SafetyError, check_host, check_mode, check_port
+from bmm.spotcheck.safety import SafetyError, check_client_id, check_host, check_mode, check_port
 
 DEFAULT_CONFIG = "config/spotcheck.toml"
 ALL_PRODUCTS = ",".join(PRODUCTS)
@@ -106,6 +106,7 @@ def _collect(args: argparse.Namespace) -> int:
         check_mode(os.environ)
         check_port(args.port)
         check_host(args.host, args.allow_host)
+        check_client_id(args.client_id)
     except SafetyError as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3
@@ -115,7 +116,7 @@ def _collect(args: argparse.Namespace) -> int:
     except SafetyError as e:  # e.g. non-paper account detected after connecting
         print(f"REFUSED: {e}", file=sys.stderr)
         return 3
-    except (ValueError, OSError, TimeoutError, ConnectionError) as e:
+    except Exception as e:  # noqa: BLE001  any other failure: clean exit 2, no traceback
         print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     for k, v in status.items():

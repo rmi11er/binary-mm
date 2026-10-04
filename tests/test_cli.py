@@ -93,3 +93,36 @@ def test_report_without_data_exits_2(capsys, tmp_path):
 
 def test_dispatcher_usage(capsys):
     assert main([]) == 2
+
+
+def test_client_id_zero_refused_without_loading_ibsource(monkeypatch, capsys):
+    monkeypatch.delitem(sys.modules, IBS, raising=False)
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    assert main(["spotcheck", "collect", "--client-id", "0"]) == 3
+    assert IBS not in sys.modules
+    assert "client id" in capsys.readouterr().err
+
+
+def test_safety_error_after_connect_exits_3(monkeypatch, capsys):
+    from bmm.spotcheck import ibsource
+    from bmm.spotcheck.safety import SafetyError
+
+    async def boom(*a, **k):
+        raise SafetyError("non-paper account")
+
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    monkeypatch.setattr(ibsource.IBSource, "connect", boom)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx"]) == 3
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_unexpected_exception_exits_2_with_error_line(monkeypatch, capsys):
+    from bmm.spotcheck import ibsource
+
+    async def boom(*a, **k):
+        raise KeyError("surprise")
+
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    monkeypatch.setattr(ibsource.IBSource, "connect", boom)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx"]) == 2
+    assert "ERROR: KeyError" in capsys.readouterr().err
