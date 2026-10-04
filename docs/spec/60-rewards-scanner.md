@@ -23,17 +23,17 @@ The adapter owns the venue's scoring:
 - `s_star_closed_form(...)` is provided only where the Polymarket US pro-rata formula applies (`R_side·w·s/(w·s+D_side)`, with w our score weight): `s* = (sqrt(R_side·w·D_side/c) − D_side)/w`. Every other adapter returns None.
 
 ## Snapshot (parquet, `data/scan/<table>/<YYYY-MM-DD>/<HHMMSS>.parquet`)
-`snapshots` (one row per half-market): `ts_ns, venue, market_id, side, title, category, expiry_ns, R_side, target_size, max_spread, venue_min, discount, D_side, depth_raw_side, bid, ask, mid, spread, top_holder_share` (null if not exposed), `fills_side_hr` (**contracts**/hr that hit this side), `markout_30m_side` (size-weighted mean signed maker markout vs mid 30 min later, $/contract; negative = adverse), `n_trades_side, coll_side, coll_verified, maker_fee, maker_rebate, settle_source, settle_ns, reference_quality ∈ {venue_ref, model_needed, none}`. Separate tables: `programs` (raw terms + hash) and `trades`.
+`snapshots` (one row per half-market): `ts_ns, venue, market_id, side, title, category, expiry_ns, R_side, target_size, max_spread, venue_min, discount, D_side, depth_raw_side, bid, ask, mid, spread, top_holder_share` (null if not exposed), `fills_side_hr` (**contracts**/hr that hit this side), `markout_30m_side` (size-weighted mean signed maker markout vs mid 30 min later, $/contract; negative = adverse), `n_trades_side, n_markout_side, coll_side, coll_verified, maker_fee, maker_rebate, settle_source, settle_ns, reference_quality ∈ {venue_ref, model_needed, none}`. Separate tables: `programs` (raw terms + hash) and `trades`.
 
 ## Cost and allocation (all in $/hr per posted contract)
 - `f = fills_side_hr / max(depth_raw_side, 1)`: contracts filled per hr per posted contract, a queue-share approximation and slightly conservative.
-- Markout shrinkage: `m = w·m_mkt + (1−w)·m_cat`, with `w = min(n_trades_side, 20)/20`. `m_cat` is the size-weighted mean over the category in this scan, falling back to all categories and then 0, flagged `c_lower_bound`.
+- Markout shrinkage: `m = w·m_mkt + (1−w)·prior`, with `w = min(n_markout_side, 20)/20`, where `n_markout_side` is the number of fills that have a +30m mid. The prior is the category mean (weighted by `n_markout_side`), falling back to the all-category mean, then to 0. The result is flagged `c_lower_bound` when there is no category prior and w < 1. Flagged markets stay out of the allocation and the top 25 and appear under "pending markouts".
 - `cost_per_fill = max(0, max(0, −m) − maker_rebate + maker_fee)`
 - `c = f·cost_per_fill + coll_side·0.05/8760`
 - `EV(s) = expected_reward(s) − c·s`. The optimum is `s*` from the closed form if available, else a numeric integer argmax over `[q, s_cap]` (q = qualifying min, `s_cap = floor(0.15·8000/coll_side)`), assuming EV is unimodal above q.
 - Qualifying rule: if `s* < q`, use `s = q` when `EV(q) > 0`, else 0.
 - Two-sided programs: the first allocation step buys both sides' q together as one block. Each side then grows independently.
-- Greedy allocation of $8,000 collateral: start each market with its qualifying block, ranked by `EV(q)/(q·coll)`, then add 1 contract at a time at `(EV(s+1)−EV(s))/coll`. Stop a market at s\*, at 15%/market ($1,200) or when its venue hits 40% ($3,200). Because of the blocks this is a heuristic. It is exact only when q = 1 and sides are unpaired.
+- Greedy allocation of $8,000 collateral (then one improvement pass: drop each funded market, refill greedily, keep the better total): start each market with its qualifying block, ranked by `EV(q)/(q·coll)`, then add 1 contract at a time at `(EV(s+1)−EV(s))/coll`. Stop a market at s\*, at 15%/market ($1,200) or when its venue hits 40% ($3,200). Two-sided programs are skipped unless both halves are present. Because of the blocks this is a heuristic. It is exact only when q = 1 and sides are unpaired.
 - Per half-market output: `s, reward_day = 24·expected_reward(s), cost_day = 24·c·s, collateral = s·coll, roc_day`.
 
 ## Exclusions (listed with the reason, never silently dropped)
