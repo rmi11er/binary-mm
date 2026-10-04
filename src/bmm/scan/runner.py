@@ -164,6 +164,7 @@ async def _market_rows(
     # --- proxy mid series: stored, else backfilled from the venue's history or its trade tape ---
     stored = _sel(ctx.proxy, a.name, mkt)
     if not stored.is_empty():
+        source = str(stored["source"][0]) if "source" in stored.columns else "trade_derived"
         fine = [
             (int(t), float(m))
             for t, m in stored.filter(pl.col("kind") == "fine").select("ts_ns", "mid").iter_rows()
@@ -203,7 +204,9 @@ async def _market_rows(
     )
     union = pl.concat([org_mids, proxy_df]).unique("ts_ns", keep="first")
     vol30, _ = mean_abs_move(fine, MARKOUT_NS)
-    p99 = tail_move_1h(fine, coarse)
+    p99 = tail_move_1h(
+        fine, coarse, fine_obs=len(trade_objs) if source == "trade_derived" else None
+    )
 
     # --- fills: tape where there is one, else estimated from sharesTraded ---
     no_tape = bool(cfg and cfg.raw.get("trades_aggressor") == "none")

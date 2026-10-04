@@ -19,7 +19,7 @@ import polars as pl
 from bmm.clock import now_ns
 from bmm.scan import config as cfgmod
 from bmm.scan import store
-from bmm.scan.allocator import Alloc, Half, allocate, cost_hr, ev, s_star, shrink_markout
+from bmm.scan.allocator import N0, Alloc, Half, allocate, cost_hr, ev, s_star, shrink_markout
 from bmm.scan.config import ScanConfig
 from bmm.scan.metrics import adverse_jump, calibrate_lambda
 from bmm.scan.models import Book, Level, Program, VenueAdapter
@@ -192,7 +192,7 @@ def analyze(
             prior = cat_mean.get(cat, overall)
             psrc = "category" if prior is not None else None
         m, lb = shrink_markout(org_m, org_n, prior)
-        w = min(org_n, 20) / 20 if org_m is not None else 0.0
+        w = min(org_n, N0) / N0 if org_m is not None else 0.0
         src = "organic" if w >= 1 else (f"blend:{psrc}" if w > 0 and psrc else psrc or "none")
         c = cost_hr(
             r["fills_side_hr"],
@@ -240,7 +240,15 @@ def analyze(
         elif not why:
             eligible.append((h, r))
     an.allocs = {
-        a.key: a for a in allocate([h for h, _ in eligible if not h.c_lower_bound], BUDGET, MKT_CAP)
+        a.key: a
+        for a in allocate(
+            [h for h, _ in eligible if not h.c_lower_bound],
+            BUDGET,
+            MKT_CAP,
+            stress_mkt_cap=STRESS_MKT,
+            stress_total_cap=STRESS_TOTAL,
+            bankroll=BUDGET,
+        )
     }
     for (
         h,

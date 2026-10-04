@@ -1,5 +1,3 @@
-import math
-
 import pytest
 
 from bmm.scan.metrics import (
@@ -18,7 +16,11 @@ H = 60 * M
 
 def test_resample_trades_last_price_forward_filled():
     t = [Trade(0, 0.4, 1.0, "buy"), Trade(12 * M, 0.5, 1.0, "sell")]
-    assert resample_trades(t) == [(0, 0.4), (5 * M, 0.4), (10 * M, 0.5)]
+    assert resample_trades(t) == [
+        (5 * M, 0.4),
+        (10 * M, 0.4),
+        (15 * M, 0.5),
+    ]  # stamped at bucket end
     assert resample_trades([]) == []
 
 
@@ -35,14 +37,19 @@ def test_tail_move_1h_uses_fine_and_scales_coarse():
     flat = [(i * 5 * M, 0.5) for i in range(288)]
     coarse = [(i * 3 * H, 0.5 if i < 10 else 0.6) for i in range(20)]
     v = tail_move_1h(flat, coarse)
-    assert v is not None and 0 < v <= 0.1 / math.sqrt(3) + 1e-9  # 3h move scaled to 1h
+    assert v is not None and 0 < v <= 0.1 + 1e-9  # 3h moves are not scaled down
+    assert (
+        tail_move_1h(flat, [], fine_obs=2) is None
+    )  # 2 real trades forward-filled != 288 observations
+    #  # 3h move scaled to 1h
     assert tail_move_1h(flat[:5], []) is None  # too few points
 
 
 def test_calibrate_lambda_clamped():
     assert calibrate_lambda([(10, -0.02, 0.05)]) == pytest.approx(0.4)
-    assert calibrate_lambda([(10, -0.5, 0.05)]) == 1.0
-    assert calibrate_lambda([(10, -0.0001, 0.05)]) == 0.05
+    assert calibrate_lambda([(10, -0.5, 0.05)]) is None  # implausible: uncalibrated, not clamped
+    assert calibrate_lambda([(10, +0.02, 0.01)]) is None  # spread capture is not adverse selection
+    assert calibrate_lambda([(10, -0.0001, 0.05)]) is None
     assert calibrate_lambda([]) is None
 
 
@@ -54,6 +61,8 @@ def test_calibrate_lambda_clamped():
         ("bid", 0.30, "normal", 0.05, 0.05),
         ("bid", 0.30, "normal", 0.50, 0.30),  # capped at the boundary
         ("ask", 0.80, "normal", None, 0.20),  # unknown tail -> worst case
+        ("ask", 0.03, "normal", 0.0, 0.01),  # flat series: floored at one tick, never 0
+        ("bid", 0.003, "high", None, 0.01),
     ],
 )
 def test_adverse_jump(side, px, jc, p99, want):
