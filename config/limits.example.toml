@@ -1,0 +1,9 @@
+# Copy to config/limits.toml and set values YOURSELF. Agents cannot edit limits.toml.
+max_order_contracts = 10
+max_net_yes_per_strike = 100
+max_gross_collateral_usd = 2000
+stop_quoting_minutes_before_resolution = 15
+max_abs_gamma_final_hour = 0.0   # set after Phase 3
+daily_loss_stop_usd = 150
+stale_futures_seconds = 3
+max_anchor_age_seconds = 30

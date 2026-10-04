@@ -1,0 +1,6 @@
+mode = "record"
+data_dir = "data"
+futures = ["MES", "ES"]          # adjust after Phase 0 shortlist
+options_underlyings = ["ES"]     # E-mini options for futures-referenced binaries
+forecastex_products = []         # filled from research/product_shortlist.md
+kalshi_readonly = false

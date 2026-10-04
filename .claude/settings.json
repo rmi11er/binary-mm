@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Edit(./config/limits.toml)",
+      "Edit(./config/live.toml)",
+      "Write(./config/limits.toml)",
+      "Write(./config/live.toml)",
+      "Bash(*--live*)",
+      "Bash(*BMM_MODE=live*)"
+    ],
+    "allow": [
+      "Bash(uv run pytest:*)",
+      "Bash(uv sync:*)",
+      "Bash(make check)",
+      "Bash(git status)",
+      "Bash(git diff:*)"
+    ]
+  }
+}

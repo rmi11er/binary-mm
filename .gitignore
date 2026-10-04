@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+secrets/
+data/
+reports/*.png
+__pycache__/
+.venv/
+.pytest_cache/
+.mypy_cache/
+config/live.toml
