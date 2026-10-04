@@ -8,10 +8,10 @@ def pr(R, D):
 
 
 def H(**kw):
-    d = dict(
-        key="a:bid", market="a", venue="v", two_sided=False,
-        reward=pr(10.0, 100.0), c=0.001, coll=0.5, q=1,
-    )  # fmt: skip
+    d = {
+        "key": "a:bid", "market": "a", "venue": "v", "two_sided": False,
+        "reward": pr(10.0, 100.0), "c": 0.001, "coll": 0.5, "q": 1,
+    }  # fmt: skip
     return Half(**(d | kw))
 
 
@@ -21,9 +21,7 @@ def test_cost_per_fill_floor_and_fees():
         0.5 * 0.022 + 0.6 * 0.05 / 8760, rel=1e-12
     )
     # favourable markout + big rebate -> cost/fill floored at 0
-    assert cost_hr(50.0, 100.0, 0.05, 0.0, 0.02, 0.6) == pytest.approx(
-        0.6 * 0.05 / 8760, rel=1e-12
-    )
+    assert cost_hr(50.0, 100.0, 0.05, 0.0, 0.02, 0.6) == pytest.approx(0.6 * 0.05 / 8760, rel=1e-12)
 
 
 def test_shrink_markout():
@@ -35,7 +33,7 @@ def test_shrink_markout():
 
 def test_numeric_s_star_matches_bruteforce():
     h = H(reward=pr(10.0, 100.0), c=0.002)
-    assert s_star(h, 5000) == max(range(0, 5001), key=lambda s: ev(h, s))
+    assert s_star(h, 5000) == max(range(5001), key=lambda s: ev(h, s))
 
 
 def test_qualifying_raise_or_zero():
@@ -51,9 +49,13 @@ def test_closed_form_used_and_rounded_to_best_integer():
 def test_caps_and_budget():
     hs = [
         H(
-            key=f"m{i}:bid", market=f"m{i}", venue="v1" if i < 5 else "v2",
-            reward=pr(1000.0, 10.0), c=1e-6, coll=1.0,
-        )  # fmt: skip
+            key=f"m{i}:bid",
+            market=f"m{i}",
+            venue="v1" if i < 5 else "v2",
+            reward=pr(1000.0, 10.0),
+            c=1e-6,
+            coll=1.0,
+        )
         for i in range(10)
     ]
     out = {a.key: a for a in allocate(hs)}
