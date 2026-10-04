@@ -3,9 +3,19 @@ import math
 import pytest
 
 from bmm.pricing import (
-    Quote, black76_call, digital_call, digital_call_smile, digital_delta,
-    digital_from_call_spread, digital_gamma, gemini_maker_rebate, hedge_contracts,
-    interp_total_variance, kalshi_taker_fee, pascal_fees, to_forecastex_orders,
+    Quote,
+    black76_call,
+    digital_call,
+    digital_call_smile,
+    digital_delta,
+    digital_from_call_spread,
+    digital_gamma,
+    gemini_maker_rebate,
+    hedge_contracts,
+    interp_total_variance,
+    kalshi_taker_fee,
+    pascal_fees,
+    to_forecastex_orders,
     two_sided_quote,
 )
 
@@ -21,7 +31,7 @@ def test_call_spread_converges_to_flat_digital():
 
 def test_smile_digital_matches_call_spread_on_skewed_smile():
     skew = -0.8  # dsig/d(ln K): equity-like
-    vol = lambda k: SIG + skew * math.log(k / F)  # noqa: E731
+    vol = lambda k: SIG + skew * math.log(k / F)
     h = 0.5
     cs = digital_from_call_spread(
         black76_call(F, K - h, T, vol(K - h)), black76_call(F, K + h, T, vol(K + h)), K - h, K + h)

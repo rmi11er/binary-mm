@@ -30,3 +30,11 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+# analyze.py is owner-supplied and frozen (docs/plans/spotcheck.md); keep its noqa as-is.
+"src/bmm/spotcheck/analyze.py" = ["RUF100"]
+
+[[tool.mypy.overrides]]
+module = ["scipy.*", "matplotlib.*", "ib_async.*"]
+ignore_missing_imports = true
