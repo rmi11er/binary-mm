@@ -12,6 +12,10 @@ class VenueNotPublic(Exception):
     """The venue's data needs credentials, is not JSON, or is otherwise not public."""
 
 
+class VenueRateLimited(VenueNotPublic):
+    """HTTP 429 persisted after backoff; the market or venue is skipped for this scan."""
+
+
 @dataclass(frozen=True)
 class Program:
     venue: str

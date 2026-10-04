@@ -22,8 +22,14 @@ The adapter owns the venue's scoring:
 - `qualifying_min(prog, side, book) → contracts` = `max(venue_min, target_size − existing_side_depth)`, floored at `venue_min`.
 - `s_star_closed_form(...)` is provided only where the Polymarket US pro-rata formula applies (`R_side·w·s/(w·s+D_side)`, with w our score weight): `s* = (sqrt(R_side·w·D_side/c) − D_side)/w`. Every other adapter returns None.
 
+## Venue scoring as implemented (all assumptions are `*_verified = false` in `config/scan_venues.toml`)
+- **pm_us:** `Score = discount^(ticks from best) × size`, pro-rata per side, walked out until `targetSize`. A tick is assumed to be $0.01. `rewardPool` is spread over 24h when `end` is null. There is **no public trade tape**, so `fills_lower_bound = true` and its halves stay in "pending". The rebate is 0.0125·p(1−p).
+- **kalshi:** the same geometric form measured from a Reference Price (the first level where cumulative size ≥ target/5). Asks are derived from NO bids. Needs both sides, so it is allocated as a block. Trade direction comes from `taker_outcome_side`.
+- **gemini:** the spread-weight curve is unpublished, so `(1 − d/max_spread)²` from the mid is an approximation. The pool is treated as shared across `pool_event_count` events, and the rebate is ignored. Both are conservative.
+- Each adapter reads one page of programs and is capped by `max_markets`. The HTTP client paces requests per host and retries 429s with backoff.
+
 ## Snapshot (parquet, `data/scan/<table>/<YYYY-MM-DD>/<HHMMSS>.parquet`)
-`snapshots` (one row per half-market): `ts_ns, venue, market_id, side, title, category, expiry_ns, R_side, target_size, max_spread, venue_min, discount, D_side, depth_raw_side, bid, ask, mid, spread, top_holder_share` (null if not exposed), `fills_side_hr` (**contracts**/hr that hit this side), `markout_30m_side` (size-weighted mean signed maker markout vs mid 30 min later, $/contract; negative = adverse), `n_trades_side, n_markout_side, coll_side, coll_verified, maker_fee, maker_rebate, settle_source, settle_ns, reference_quality ∈ {venue_ref, model_needed, none}`. Separate tables: `programs` (raw terms + hash) and `trades`.
+`snapshots` (one row per half-market): `ts_ns, venue, market_id, side, title, category, expiry_ns, R_side, target_size, max_spread, venue_min, discount, D_side, depth_raw_side, bid, ask, mid, spread, top_holder_share` (null if not exposed), `fills_side_hr` (**contracts**/hr that hit this side), `markout_30m_side` (size-weighted mean signed maker markout vs mid 30 min later, $/contract; negative = adverse), `n_trades_side, n_markout_side, fills_lower_bound, coll_side, coll_verified, maker_fee, maker_rebate, settle_source, settle_ns, reference_quality ∈ {venue_ref, model_needed, none}`. Separate tables: `programs` (raw terms + hash) and `trades`.
 
 ## Cost and allocation (all in $/hr per posted contract)
 - `f = fills_side_hr / max(depth_raw_side, 1)`: contracts filled per hr per posted contract, a queue-share approximation and slightly conservative.

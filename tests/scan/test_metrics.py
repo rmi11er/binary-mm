@@ -145,3 +145,19 @@ def test_snapshot_scales_fee_to_p1p_and_flags_no_tape(tmp_path):
     assert all(r["fills_lower_bound"] for r in rows)
     assert rows[0]["maker_fee"] == pytest.approx(0.02 * 0.5 * 0.5)  # mid = 0.50
     assert rows[0]["maker_rebate"] == pytest.approx(0.0125 * 0.25)
+
+
+def test_unknown_collateral_rule_falls_back_and_bad_market_is_skipped(tmp_path, caplog):
+    from bmm.scan.config import VenueCfg
+
+    class Boom(Fake):
+        async def book(self, market_id):
+            raise KeyError("shape changed")
+
+    caplog.set_level(logging.WARNING)
+    cfg = {"v": VenueCfg("v", {"coll_bid": "p", "coll_ask": "unknown"})}
+    rows = asyncio.run(snapshot_once([Fake("v")], NOW, cfgs=cfg, root=tmp_path))["snapshots"]
+    ask = next(r for r in rows if r["side"] == "ask")
+    assert ask["coll_side"] == pytest.approx(1 - 0.51)  # side default "1-p" at the ask
+    out = asyncio.run(snapshot_once([Boom("v")], NOW, root=tmp_path))
+    assert out["snapshots"] == [] and "shape changed" in caplog.text

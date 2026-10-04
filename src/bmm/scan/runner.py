@@ -121,7 +121,11 @@ async def _market_rows(
         D, raw = a.scored_depth(prog, s, book)
         px = (bid if s == "bid" else ask) or mid or 0.5
         expr = cfg.raw.get(f"coll_{side}") if cfg else None
-        if expr is None or str(expr).strip().startswith("["):
+        if (
+            expr is None
+            or str(expr).strip().lower() in {"", "unknown"}
+            or str(expr).strip().startswith("[")
+        ):
             expr = SIDE_COLL_DEFAULT[side]
         m, n_mo = markout_30m(tr, mids, s)
         n_side = sum(1 for t in trade_objs if side_of(t, mid) == s)
@@ -177,8 +181,8 @@ async def snapshot_once(
                     trades_hist,
                     out,
                 )
-            except VenueNotPublic as e:
-                log.warning("market %s/%s skipped: %s", a.name, prog.market_id, e)
+            except Exception as e:  # noqa: BLE001 - one bad market must not kill the scan; logged
+                log.warning("market %s/%s skipped: %r", a.name, prog.market_id, e)
     return out
 
 
