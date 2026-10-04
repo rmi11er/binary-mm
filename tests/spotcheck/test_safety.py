@@ -166,6 +166,7 @@ def test_entry_points_do_not_pull_order_modules():
         "import pkgutil, importlib, sys, bmm.spotcheck as s\n"
         "for m in pkgutil.iter_modules(s.__path__):\n"
         "    importlib.import_module('bmm.spotcheck.' + m.name)\n"
+        "import bmm.cli\n"
         "bad = [m for m in sys.modules if m.startswith(('bmm.gateway','bmm.quoter',"
         "'bmm.hedger','bmm.risk','bmm.pricing.quoting'))]\n"
         "print(bad)\n"

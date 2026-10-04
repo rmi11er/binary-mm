@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5", "mypy>=1.10", "hypothesis>=6"]
 
+[project.scripts]
+bmm = "bmm.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
