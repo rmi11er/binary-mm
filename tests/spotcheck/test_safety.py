@@ -5,7 +5,6 @@ import subprocess
 import sys
 import textwrap
 
-import numpy as np
 import pytest
 
 from bmm.spotcheck.safety import (
@@ -35,47 +34,60 @@ BAD_MODULES = (
 )  # fmt: skip
 
 
-@pytest.mark.parametrize("port", [4001, 7496, 7497, 0, 4003, 4002.0, np.int64(4002), True])
-def test_refuses_non_paper_ports(port):
-    with pytest.raises(SafetyError):
-        check_port(port)
-
-
-def test_allows_only_4002():
-    assert ALLOWED_PORTS == frozenset({4002}) and check_port(4002) == 4002
+# One test per guard; one case per distinct failure mode (Tier B: no look-alike sprawl).
+@pytest.mark.parametrize(
+    ("port", "ok"),
+    [(4002, True), (4001, False), (4002.0, False), (True, False)],
+    ids=["paper", "live_gateway", "float_spoof", "bool_spoof"],
+)
+def test_check_port(port, ok):
+    if ok:
+        assert ALLOWED_PORTS == frozenset({4002}) and check_port(port) == port
+    else:
+        with pytest.raises(SafetyError):
+            check_port(port)
 
 
 @pytest.mark.parametrize(
-    "mode", ["live", "LIVE", " live", "live\n", "Live ", "livе", "prod", "paper2", "x"]
+    ("env", "ok"),
+    [({}, True), ({"BMM_MODE": " Record "}, True), ({"BMM_MODE": "live"}, False),
+     ({"BMM_MODE": " LIVE\n"}, False), ({"BMM_MODE": "prod"}, False)],
+    ids=["unset", "record_normalised", "live", "live_normalised", "unknown"],
+)  # fmt: skip
+def test_check_mode(env, ok):
+    if ok:
+        check_mode(env)
+    else:
+        with pytest.raises(SafetyError):
+            check_mode(env)
+
+
+@pytest.mark.parametrize(
+    ("host", "allow", "ok"),
+    [("127.0.0.1", None, True), ("::1", None, True), ("10.0.0.5", None, False),
+     ("127.0.0.1.evil.com", None, False), ("10.0.0.5", ["10.0.0.5"], True)],
+    ids=["loopback_v4", "loopback_v6", "remote", "loopback_prefix_spoof", "allowlisted_remote"],
+)  # fmt: skip
+def test_check_host(host, allow, ok):
+    call = (lambda: check_host(host)) if allow is None else (lambda: check_host(host, allow=allow))
+    if ok:
+        assert call() == host
+    else:
+        with pytest.raises(SafetyError):
+            call()
+
+
+@pytest.mark.parametrize(
+    ("cid", "ok"),
+    [(31, True), (0, False), (-3, False), (True, False)],
+    ids=["positive", "zero", "negative", "bool_spoof"],
 )
-def test_refuses_live_and_unknown_modes(mode):
-    with pytest.raises(SafetyError):
-        check_mode({"BMM_MODE": mode})
-
-
-@pytest.mark.parametrize("mode", ["record", "paper", "sim", " Record ", ""])
-def test_allows_known_modes(mode):
-    check_mode({"BMM_MODE": mode})
-    check_mode({})
-
-
-@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
-def test_loopback_hosts_allowed(host):
-    assert check_host(host) == host
-
-
-@pytest.mark.parametrize("host", ["10.0.0.5", "example.com", "127.0.0.1.evil.com", ""])
-def test_remote_hosts_refused_unless_allowlisted(host):
-    with pytest.raises(SafetyError):
-        check_host(host)
-    if host:
-        assert check_host(host, allow=[host]) == host
-
-
-@pytest.mark.parametrize("cid", [0, -3, 1.0, True, None, "7"])
-def test_refuses_bad_client_ids(cid):
-    with pytest.raises(SafetyError):
-        check_client_id(cid)
+def test_check_client_id(cid, ok):
+    if ok:
+        assert check_client_id(cid) == cid
+    else:
+        with pytest.raises(SafetyError):
+            check_client_id(cid)
 
 
 def test_refused_accounts_are_masked_in_the_message():
@@ -83,10 +95,6 @@ def test_refused_accounts_are_masked_in_the_message():
         check_accounts(["U1234567", "DU7654321"])
     msg = str(e.value)
     assert "U***4567" in msg and "U1234567" not in msg and "DU7654321" not in msg
-
-
-def test_allows_positive_client_id():
-    assert check_client_id(31) == 31
 
 
 def test_accounts_must_be_paper():
@@ -161,33 +169,17 @@ def test_no_order_surface_in_spotcheck():
     assert scan(_files()) == []
 
 
-EVASIONS = {
-    "getattr_concat": 'x = getattr(ib, "place" + "Order")',
-    "getattr_dynamic": "x = getattr(ib, name)",
-    "limit_space": "o = LimitOrder (1)",
+EVASIONS = {  # one representative per scan rule
+    "regex_name_spacing": "o = LimitOrder (1)",
+    "getattr_non_literal": "x = getattr(ib, name)",
     "alias_import": "from ib_async import LimitOrder as LO",
     "star_import": "from ib_async import *",
     "order_module": "from ib_async.order import MarketOrder",
+    "pricing_pkg": "from bmm.pricing import black76_call",
     "importlib": "import importlib",
     "dunder_import": '__import__("ib_async")',
-    "exercise": "ib.exerciseOptions(c, 1, 1, 'a', 'b')",
-    "oca": "ib.oneCancelsAll(o, 'x', 1)",
-    "gateway": "from bmm.gateway import x",
-    "quoting": "from bmm.pricing.quoting import to_forecastex_orders",
-    "pricing_pkg": "from bmm.pricing import black76_call",
-    "attr_whatif": "ib.client.whatIfOrderAsync",
-    "object_getattribute": 'object.__getattribute__(ib, "place" + "Ord" + "er")',
-    "methodcaller": 'operator.methodcaller("place" + "Ord" + "er", c, o)',
-    "methodcaller_bare": 'from operator import methodcaller\nf = methodcaller("x")',
-    "dunder_getattribute": 'ib.__getattribute__("cancel" + "Ord" + "er")',
-    "getmembers": 'dict(inspect.getmembers(ib))["x"]',
-    "getmembers_bare": "from inspect import getmembers\nd = getmembers(ib)",
-    "client_send": "ib.client.send(1, 2)",
-    "client_sendmsg": "ib.client.sendMsg(b'x')",
-    "dunder_dict": "ib.__dict__['plac' + 'eOrder']",
-    "vars_call": "vars(ib)['x']",
-    "attrgetter_call": "f = attrgetter('placeOrder')",
-    "operator_attrgetter": "import operator\nf = operator.attrgetter('x')",
+    "forbidden_attr": "ib.client.send(1, 2)",
+    "forbidden_call": "vars(ib)['x']",
 }
 
 

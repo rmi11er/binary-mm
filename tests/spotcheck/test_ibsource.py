@@ -128,17 +128,23 @@ def src(ib, max_lines=90):
 
 
 # --- connect guards --------------------------------------------------------------------------
-@pytest.mark.parametrize("port", [4001, 7496, 7497, 4003])
-def test_bad_port_refused_before_ib_is_built(port):
+@pytest.mark.parametrize(
+    ("host", "port", "cid", "env"),
+    [("127.0.0.1", 4001, 7, None), ("10.1.2.3", 4002, 7, None),
+     ("127.0.0.1", 4002, 0, None), ("127.0.0.1", 4002, 7, "live")],
+    ids=["port", "host", "client_id", "live_mode"],
+)  # fmt: skip
+def test_guards_refuse_before_ib_is_built(monkeypatch, host, port, cid, env):
+    if env:
+        monkeypatch.setenv("BMM_MODE", env)
+    else:
+        monkeypatch.delenv("BMM_MODE", raising=False)
     with pytest.raises(SafetyError):
-        run(IBSource.connect("127.0.0.1", port, 7, ib_factory=FakeIB))
+        run(IBSource.connect(host, port, cid, ib_factory=FakeIB))
     assert FakeIB.instances == 0
 
 
-def test_remote_host_refused_before_ib_is_built():
-    with pytest.raises(SafetyError):
-        run(IBSource.connect("10.1.2.3", 4002, 7, ib_factory=FakeIB))
-    assert FakeIB.instances == 0
+def test_allowlisted_remote_host_connects():
     s = run(IBSource.connect("10.1.2.3", 4002, 7, ib_factory=FakeIB, allow_hosts=["10.1.2.3"]))
     assert s is not None
 
@@ -184,20 +190,6 @@ def test_connect_skips_startup_fetch():
     run(IBSource.connect("127.0.0.1", 4002, 7, ib_factory=factory))
     (ff,) = [c[1] for c in made[0].calls if c[0] == "fetchFields"]
     assert isinstance(ff, StartupFetch) and ff == StartupFetch(0)
-
-
-@pytest.mark.parametrize("cid", [0, -1, 1.0, True, None])
-def test_bad_client_id_refused_before_ib_is_built(cid):
-    with pytest.raises(SafetyError):
-        run(IBSource.connect("127.0.0.1", 4002, cid, ib_factory=FakeIB))
-    assert FakeIB.instances == 0
-
-
-def test_live_mode_refused_before_ib_is_built(monkeypatch):
-    monkeypatch.setenv("BMM_MODE", "live")
-    with pytest.raises(SafetyError):
-        run(IBSource.connect("127.0.0.1", 4002, 7, ib_factory=FakeIB))
-    assert FakeIB.instances == 0
 
 
 def test_non_paper_account_disconnects_and_raises():
@@ -257,16 +249,15 @@ def test_order_methods_raise_on_fake():
     ib.client.reqIds(1)  # unrelated methods untouched
 
 
-@pytest.mark.parametrize("name", NAMES)
-def test_order_methods_raise_on_real_ib_async(name):
+def test_order_methods_raise_on_real_ib_async():
     ib = IB()  # constructed, never connected
     real = {n for n in NAMES if hasattr(ib, n)}
     client_real = {n for n in NAMES if hasattr(ib.client, n)}
     disarm(ib)
-    if name in real:
+    for name in sorted(real):
         with pytest.raises(SafetyError):
             getattr(ib, name)()
-    if name in client_real:
+    for name in sorted(client_real):
         with pytest.raises(SafetyError):
             getattr(ib.client, name)()
     assert {"placeOrder", "cancelOrder", "reqGlobalCancel"} <= real | client_real

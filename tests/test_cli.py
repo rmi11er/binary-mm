@@ -11,26 +11,22 @@ SESSION = ROOT / "tests/fixtures/spotcheck/session.json"
 IBS = "bmm.spotcheck.ibsource"
 
 
-def test_bad_port_refused_without_loading_ibsource(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("argv", "env", "err"),
+    [(["--port", "4001"], None, "REFUSED"), (["--host", "10.0.0.9"], None, None),
+     (["--client-id", "0"], None, "client id"), ([], "live", None)],
+    ids=["port", "host", "client_id", "live_mode"],
+)  # fmt: skip
+def test_guards_refuse_without_loading_ibsource(monkeypatch, capsys, argv, env, err):
     monkeypatch.delitem(sys.modules, IBS, raising=False)
-    monkeypatch.delenv("BMM_MODE", raising=False)
-    assert main(["spotcheck", "collect", "--port", "4001", "--product", "forecastex-spx"]) == 3
+    if env:
+        monkeypatch.setenv("BMM_MODE", env)
+    else:
+        monkeypatch.delenv("BMM_MODE", raising=False)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx", *argv]) == 3
     assert IBS not in sys.modules
-    assert "REFUSED" in capsys.readouterr().err
-
-
-def test_live_mode_refused(monkeypatch):
-    monkeypatch.delitem(sys.modules, IBS, raising=False)
-    monkeypatch.setenv("BMM_MODE", "live")
-    assert main(["spotcheck", "collect", "--product", "forecastex-spx"]) == 3
-    assert IBS not in sys.modules
-
-
-def test_remote_host_refused_unless_allowlisted(monkeypatch):
-    monkeypatch.delitem(sys.modules, IBS, raising=False)
-    monkeypatch.delenv("BMM_MODE", raising=False)
-    assert main(["spotcheck", "collect", "--host", "10.0.0.9"]) == 3
-    assert IBS not in sys.modules
+    if err:
+        assert err in capsys.readouterr().err
 
 
 def test_fixture_run_writes_three_tables(tmp_path, monkeypatch):
@@ -93,14 +89,6 @@ def test_report_without_data_exits_2(capsys, tmp_path):
 
 def test_dispatcher_usage(capsys):
     assert main([]) == 2
-
-
-def test_client_id_zero_refused_without_loading_ibsource(monkeypatch, capsys):
-    monkeypatch.delitem(sys.modules, IBS, raising=False)
-    monkeypatch.delenv("BMM_MODE", raising=False)
-    assert main(["spotcheck", "collect", "--client-id", "0"]) == 3
-    assert IBS not in sys.modules
-    assert "client id" in capsys.readouterr().err
 
 
 def test_safety_error_after_connect_exits_3(monkeypatch, capsys):
