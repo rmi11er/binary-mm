@@ -41,13 +41,20 @@ def check_host(host: str, allow: Iterable[str] = ()) -> str:
     return host
 
 
+def mask_account(acct: str) -> str:
+    """U1234567 -> U***4567 (ids are identifiers, not credentials, but keep them out of logs)."""
+    a = str(acct)
+    return a if len(a) <= 5 else f"{a[0]}***{a[-4:]}"
+
+
 def check_accounts(accounts: Iterable[str]) -> list[str]:
     """Every managed account must look like a paper account. Fail closed on none."""
     accts = list(accounts)
     bad = [a for a in accts if not str(a).startswith(PAPER_ACCOUNT_PREFIX)]
     if not accts or bad:
         raise SafetyError(
-            f"spotcheck refuses non-paper managed accounts {bad or accts!r} "
+            f"spotcheck refuses non-paper managed accounts "
+            f"{[mask_account(a) for a in (bad or accts)]!r} "
             f"(expected prefix {PAPER_ACCOUNT_PREFIX!r})"
         )
     return accts

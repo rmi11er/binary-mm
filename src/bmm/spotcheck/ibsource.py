@@ -54,11 +54,50 @@ def _stub(name: str) -> Callable[..., Any]:
     return refuse
 
 
+# Outgoing ib_async message ids that place, modify or cancel orders (or FA config). Taken from
+# ib_async's own client.py: PLACE_ORDER 3 (client.py:487 "PLACE_ORDER message type"), cancel
+# 4 (client.py:715 `fields = [4, 1, orderId]`), FA replace 19 (client.py:806), option exercise 21
+# (client.py:846), global cancel 58 (client.py:981).
+ORDER_MSG_IDS: frozenset[str] = frozenset({"3", "4", "19", "21", "58"})
+
+
+def _guard_send(client: Any) -> bool:
+    """Wrap client.send / client.sendMsg so an order message id raises SafetyError."""
+    wrapped = False
+    send = getattr(client, "send", None)
+    if callable(send):
+
+        def guarded_send(*fields: Any, **kw: Any) -> Any:
+            if fields and str(fields[0]) in ORDER_MSG_IDS:
+                raise SafetyError(f"spotcheck is market-data only; message id {fields[0]} refused")
+            return send(*fields, **kw)
+
+        object.__setattr__(client, "send", guarded_send)
+        wrapped = True
+    send_msg = getattr(client, "sendMsg", None)
+    if callable(send_msg):
+
+        def guarded_msg(msg: Any, *a: Any, **kw: Any) -> Any:
+            if isinstance(msg, str) and msg.split("\0", 1)[0] in ORDER_MSG_IDS:
+                raise SafetyError("spotcheck is market-data only; order message refused")
+            return send_msg(msg, *a, **kw)
+
+        object.__setattr__(client, "sendMsg", guarded_msg)
+        wrapped = True
+    return wrapped
+
+
 def disarm(ib: Any) -> list[str]:
-    """Replace every order-surface method on `ib` and `ib.client` with a raising stub."""
+    """Replace every order-surface method on `ib` and `ib.client` with a raising stub (events such
+    as the order events are left alone), and guard `client.send` / `sendMsg` against order
+    message ids."""
     done: list[str] = []
+    if _guard_send(ib.client):
+        done.append("client.send")
     for label, obj in (("ib", ib), ("client", ib.client)):
         for name in dir(obj):
+            if name.lower().endswith("event"):
+                continue
             if _ARMED.search(name):
                 object.__setattr__(obj, name, _stub(f"{label}.{name}"))  # shadows the class method
                 done.append(f"{label}.{name}")
@@ -111,8 +150,9 @@ class IBSource:
         ib = ib_factory()
         disarm(ib)
         try:
-            # StartupFetch(0): skip the default positions/executions/account-update pulls, which run
-            # before the paper-account check below.
+            # StartupFetch(0) skips the executions / account-update / open-order pulls, but ib_async
+            # 2.1 (ib.py:2056) still sends reqPositions unconditionally before our DU check below.
+            # That request is read-only and spotcheck never reads the result.
             await ib.connectAsync(
                 host, port, clientId=client_id, readonly=True, fetchFields=StartupFetch(0)
             )

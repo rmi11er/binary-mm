@@ -663,3 +663,111 @@ def test_failed_requote_sets_after_none_and_flags_null(tmp_path):
     assert pre["und_px_after"].null_count() == pre.height
     assert pre["df_flag"].null_count() == pre.height
     assert (pre["und_px_before"].is_not_null()).all()
+
+
+# --- risk audit round 1: roll handling ---------------------------------------------------------
+class RollAt:
+    """Future con_id +1 from the `n_from`-th reference_future call on."""
+
+    def __init__(self, inner, n_from, no_price_on=()):
+        self.inner, self.n, self.n_from, self.no_price_on = inner, 0, n_from, set(no_price_on)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def reference_future(self, *a):
+        from dataclasses import replace
+
+        f = await self.inner.reference_future(*a)
+        self.n += 1
+        if self.n >= self.n_from:
+            f = replace(f, con_id=f.con_id + 1)
+        if self.n in self.no_price_on:
+            from bmm.spotcheck.normalise import raw_quote
+
+            f = replace(f, quote=raw_quote(None, None, 0, 0))
+        return f
+
+
+def test_roll_at_requote_restarts_snapshot(tmp_path):
+    # call 1,2 = snapshot 1; call 3 = snapshot 2 before (same con); call 4 = its re-quote (rolled)
+    log: list[str] = []
+    _, status = go(lambda s: Recorder(RollAt(s, 4), log), products=[PRODUCTS["forecastex-spx"]],
+                   tmp=tmp_path)  # fmt: skip
+    assert status == {"forecastex-spx": "ok"}
+    o = _order(log)
+    assert o[5:9] == ["future", "ladder", "expiries", "calls"]  # snapshot 2, normal until re-quote
+    assert o[10:13] == ["ladder", "future", "expiries"]  # restarted first-style
+    assert _read(tmp_path, "futures")["snapshot_id"].n_unique() == 97
+
+
+def test_failing_restart_after_requote_roll_is_a_product_failure(tmp_path):
+    class FailLadderOnce:
+        """After the roll is seen, the restart's ladder fails."""
+
+        def __init__(self, inner):
+            self.inner, self.armed, self.n = inner, False, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            from dataclasses import replace
+
+            f = await self.inner.reference_future(*a)
+            self.n += 1
+            if self.n == 4:
+                self.armed = True
+                return replace(f, con_id=f.con_id + 1)
+            return f
+
+        async def ladder(self, *a):
+            if self.armed:
+                self.armed = False
+                raise SourceError("restart ladder failed")
+            return await self.inner.ladder(*a)
+
+    _, status = go(FailLadderOnce, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    fut = _read(tmp_path, "futures")
+    # the failed snapshot wrote nothing (not a flagged pre-roll row); later ones recover
+    assert fut["snapshot_id"].n_unique() == 96
+    assert status == {"forecastex-spx": "ok"}  # one failure, then recovered
+
+
+def test_con_id_change_between_quotes_on_uncached_snapshot_flags_it(tmp_path):
+    from dataclasses import replace
+
+    class NewConEachCall:
+        def __init__(self, inner):
+            self.inner, self.n = inner, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            f = await self.inner.reference_future(*a)
+            self.n += 1
+            return replace(f, con_id=f.con_id + (1 if self.n >= 2 else 0))
+
+    vc = VClock(ct(11, 30))
+    inner = FixtureSource.from_json(SESSION, clock=vc)
+    # snapshot 1 only: uncached; the re-quote has a different con_id
+    src = Recorder(NewConEachCall(inner), [])
+    asyncio.run(collect_once_wrapper(src, vc, tmp_path))
+    fut = _read(tmp_path, "futures")
+    assert fut["und_px_after"][0] is None and fut["df_flag"][0] is None
+
+
+def collect_once_wrapper(src, vc, tmp):
+    from bmm.spotcheck.collect import collect_once
+
+    return collect_once(src, PRODUCTS["forecastex-spx"], D, ParquetSink(tmp), "s0", vc(), None,
+                        write_details=True, clock=vc)  # fmt: skip
+
+
+def test_priceless_rolled_future_on_cached_path_restarts_instead_of_failing(tmp_path):
+    # call 3 = snapshot 2 before-quote: rolled AND priceless. con_id must be checked before _mid.
+    _, status = go(lambda s: RollAt(s, 3, no_price_on=(3,)), products=[PRODUCTS["forecastex-spx"]],
+                   tmp=tmp_path)  # fmt: skip
+    assert status == {"forecastex-spx": "ok"}
+    assert _read(tmp_path, "futures")["snapshot_id"].n_unique() == 97

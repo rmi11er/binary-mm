@@ -27,9 +27,9 @@ FORBIDDEN = re.compile(
 ORDER_ATTRS = {
     "placeOrder", "cancelOrder", "reqGlobalCancel", "whatIfOrder", "whatIfOrderAsync",
     "bracketOrder", "oneCancelsAll", "exerciseOptions", "reqAutoOpenOrders", "reqOpenOrders",
-    "send", "sendMsg", "__dict__", "attrgetter",
+    "send", "sendMsg", "__dict__", "attrgetter", "__getattribute__", "methodcaller", "getmembers",
 }  # fmt: skip
-ORDER_CALLS = {"__import__", "import_module", "vars", "attrgetter"}
+ORDER_CALLS = {"__import__", "import_module", "vars", "attrgetter", "methodcaller", "getmembers"}
 BAD_MODULES = (
     "bmm.gateway", "bmm.quoter", "bmm.hedger", "bmm.risk", "bmm.pricing.quoting", "ib_async.order",
 )  # fmt: skip
@@ -78,6 +78,13 @@ def test_refuses_bad_client_ids(cid):
         check_client_id(cid)
 
 
+def test_refused_accounts_are_masked_in_the_message():
+    with pytest.raises(SafetyError) as e:
+        check_accounts(["U1234567", "DU7654321"])
+    msg = str(e.value)
+    assert "U***4567" in msg and "U1234567" not in msg and "DU7654321" not in msg
+
+
 def test_allows_positive_client_id():
     assert check_client_id(31) == 31
 
@@ -121,6 +128,9 @@ def scan(paths):
                         hits.append(f"{where}:import {a.name}")
             elif isinstance(node, ast.Attribute) and node.attr in ORDER_ATTRS:
                 hits.append(f"{where}:attr {node.attr}")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in ORDER_CALLS:
+                    hits.append(f"{where}:dynamic attr call {node.func.attr}")
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 if node.func.id in ORDER_CALLS:
                     hits.append(f"{where}:dynamic import")
@@ -166,6 +176,12 @@ EVASIONS = {
     "quoting": "from bmm.pricing.quoting import to_forecastex_orders",
     "pricing_pkg": "from bmm.pricing import black76_call",
     "attr_whatif": "ib.client.whatIfOrderAsync",
+    "object_getattribute": 'object.__getattribute__(ib, "place" + "Ord" + "er")',
+    "methodcaller": 'operator.methodcaller("place" + "Ord" + "er", c, o)',
+    "methodcaller_bare": 'from operator import methodcaller\nf = methodcaller("x")',
+    "dunder_getattribute": 'ib.__getattribute__("cancel" + "Ord" + "er")',
+    "getmembers": 'dict(inspect.getmembers(ib))["x"]',
+    "getmembers_bare": "from inspect import getmembers\nd = getmembers(ib)",
     "client_send": "ib.client.send(1, 2)",
     "client_sendmsg": "ib.client.sendMsg(b'x')",
     "dunder_dict": "ib.__dict__['plac' + 'eOrder']",

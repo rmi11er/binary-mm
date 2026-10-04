@@ -60,6 +60,15 @@ class FakeIB:
     def bracketOrder(self, *a): ...
 
     async def connectAsync(self, host, port, clientId, readonly, fetchFields=None):
+        # R-I1: at the moment the socket would open, every order method must already be disarmed
+        for label, obj in (("ib", self), ("client", self.client)):
+            for name in ("placeOrder", "cancelOrder", "reqGlobalCancel"):
+                try:
+                    object.__getattribute__(obj, name)()
+                    armed = True
+                except SafetyError:
+                    armed = False
+                self.calls.append(("armed_at_connect", f"{label}.{name}", armed))
         self.calls.append(("connectAsync", host, port, clientId, readonly))
         self.calls.append(("fetchFields", fetchFields))
 
@@ -145,7 +154,27 @@ def test_connect_is_readonly_on_4002():
     assert ("connectAsync", "127.0.0.1", 4002, 7, True) in made[0].calls
 
 
+def test_connect_disarms_before_the_socket_opens():
+    """Mutation check (R-I1): removing `disarm(ib)` from IBSource.connect makes this fail."""
+    made = []
+
+    def factory():
+        made.append(FakeIB())
+        return made[-1]
+
+    run(IBSource.connect("127.0.0.1", 4002, 7, ib_factory=factory))
+    probes = [c for c in made[0].calls if c[0] == "armed_at_connect"]
+    assert {c[1] for c in probes} == {
+        f"{o}.{n}"
+        for o in ("ib", "client")
+        for n in ("placeOrder", "cancelOrder", "reqGlobalCancel")
+    }
+    assert probes and not any(c[2] for c in probes), probes
+
+
 def test_connect_skips_startup_fetch():
+    """StartupFetch(0) drops executions / account / open-order pulls only: ib_async 2.1 still sends
+    reqPositions unconditionally (ib.py:2056) before our DU check. Read-only, never read."""
     made = []
 
     def factory():
@@ -421,8 +450,13 @@ def test_lead_quarterly_cross_checks_month_named_in_question():
 def test_future_quote_ignores_size_zero_prices():
     ib = FakeIB()
     ib.details_by_type["FUT"] = [fut_cd("202612", "20261218", 1)]
-    object.__setattr__(ib, "ticker_fn", lambda c: NS(bid=6500.0, ask=6501.0, bidSize=0, askSize=5,
-                                                     last=6500.5, lastSize=1, volume=NAN))
+    object.__setattr__(
+        ib,
+        "ticker_fn",
+        lambda c: NS(
+            bid=6500.0, ask=6501.0, bidSize=0, askSize=5, last=6500.5, lastSize=1, volume=NAN
+        ),
+    )
     f = run(src(ib).reference_future(PRODUCTS["forecastex-spx"], QD, [], None))
     assert f.quote.bid is None and f.quote.ask == 6501.0 and f.quote.last == 6500.5
 
@@ -438,8 +472,10 @@ def test_option_quotes_drop_stale_and_crossed_and_carry_sizes():
     object.__setattr__(ib, "ticker_fn", lambda c: quotes[next(n)])
     exp = OptExpiry(1, 1, "ES", "20261005")
     out = run(src(ib).calls(PRODUCTS["forecastex-spx"], exp, [6500.0, 6510.0, 6520.0]))
-    assert [(q.strike, q.call_bid, q.call_ask) for q in out] == [(6500.0, 1.0, 1.2),
-                                                                  (6510.0, 0.0, 1.2)]
+    assert [(q.strike, q.call_bid, q.call_ask) for q in out] == [
+        (6500.0, 1.0, 1.2),
+        (6510.0, 0.0, 1.2),
+    ]
     assert (out[0].call_bid_size, out[0].call_ask_size) == (7, 9)
 
 
@@ -475,3 +511,56 @@ def test_event_contract_and_ec_classes_never_returned():
     fut = FutQuote(1, "GCZ6", "202612", raw_quote(None, None, 0, 0))
     got = run(src(ib).option_expiries(spec, fut, QD))
     assert {e.trading_class for e in got} == {"OG"}
+
+
+# --- risk audit round 1 --------------------------------------------------------------------------
+def _real_ib():
+    ib = IB()
+    disarm(ib)
+    return ib
+
+
+def test_client_send_refuses_order_message_ids_on_real_ib():
+    from bmm.spotcheck.ibsource import ORDER_MSG_IDS
+
+    ib = _real_ib()
+    for mid in ORDER_MSG_IDS:
+        with pytest.raises(SafetyError):
+            ib.client.send(int(mid), 1, 2)
+        with pytest.raises(SafetyError):
+            ib.client.sendMsg(f"{mid}\x001\x00")
+    # a market-data message passes the guard and then fails because the socket is not connected
+    with pytest.raises(ConnectionError):
+        ib.client.send(61, 1)  # reqPositions
+
+
+def test_order_message_ids_match_ib_async_source():
+    """The ids must come from ib_async itself, not from memory."""
+    import inspect
+
+    from ib_async import client as c
+
+    from bmm.spotcheck.ibsource import ORDER_MSG_IDS
+
+    src = inspect.getsource(c.Client)
+    assert "3,  # PLACE_ORDER message type" in src
+    assert "fields = [4, 1, orderId]" in src
+    assert "self.send(58, 1)" in src
+    assert "self.send(19, 1, faData, cxml, reqId)" in src
+    assert "self.send(\n            21," in src
+    assert ORDER_MSG_IDS == {"3", "4", "19", "21", "58"}
+
+
+def test_events_are_not_stubbed_but_cancel_order_is():
+    ib = _real_ib()
+    assert type(ib.cancelOrderEvent).__name__ == "Event"
+    with pytest.raises(SafetyError):
+        ib.cancelOrder(None)
+
+
+def test_event_attributes_skipped_on_fake():
+    ib = FakeIB()
+    object.__setattr__(ib, "cancelOrderEvent", object())
+    marker = ib.cancelOrderEvent
+    disarm(ib)
+    assert ib.cancelOrderEvent is marker

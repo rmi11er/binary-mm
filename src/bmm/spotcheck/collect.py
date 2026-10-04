@@ -170,8 +170,9 @@ async def collect_once(
     if cached is not None:
         fut = await source.reference_future(spec, question_date, cached[0], gc_month)
         fut_before_ts = now()
-        f_before = _mid(fut, spec, log)
-        if fut.con_id != cached[1].con_id:
+        if (
+            fut.con_id != cached[1].con_id
+        ):  # checked before _mid: a priceless rolled future restarts
             assert fut_memo is not None
             log.warning("reference future changed; cache dropped", product=spec.key)
             del fut_memo[spec.key]
@@ -179,6 +180,7 @@ async def collect_once(
                 source, spec, question_date, sink, snapshot_id, ts_ns, gc_month, write_details,
                 log, clock, sigma_memo, fut_memo,
             )  # fmt: skip
+        f_before = _mid(fut, spec, log)
         quotes, details = await source.ladder(spec, question_date)
         ladder_ts = now()
     else:
@@ -245,9 +247,17 @@ async def collect_once(
     f_after: float | None = f_before
     fut_ts = fut_before_ts
     if chains:
+        fut2 = None
         try:
             fut2 = await source.reference_future(spec, question_date, details, gc_month)
-            if fut2.con_id != fut.con_id and cached is not None:
+        except CAUGHT as e:
+            f_after = None
+            log.warning("future re-quote failed; snapshot flagged", product=spec.key,
+                        error=str(e))  # fmt: skip
+        if fut2 is not None and fut2.con_id != fut.con_id:
+            if cached is not None:
+                # roll between the quotes: drop the cache and restart. Outside the try above, so
+                # a failing restart is a product failure, not a "re-quote failure".
                 assert fut_memo is not None
                 log.warning("reference future changed; cache dropped", product=spec.key)
                 del fut_memo[spec.key]
@@ -255,12 +265,17 @@ async def collect_once(
                     source, spec, question_date, sink, snapshot_id, ts_ns, gc_month,
                     write_details, log, clock, sigma_memo, fut_memo,
                 )  # fmt: skip
-            f_after = _mid(fut2, spec, log)
-            fut_ts = now()
-        except CAUGHT as e:
+            log.warning("reference future changed between quotes; snapshot flagged",
+                        product=spec.key, before=fut.con_id, after=fut2.con_id)  # fmt: skip
             f_after = None
-            log.warning("future re-quote failed; snapshot flagged", product=spec.key,
-                        error=str(e))  # fmt: skip
+        elif fut2 is not None:
+            try:
+                f_after = _mid(fut2, spec, log)
+                fut_ts = now()
+            except CAUGHT as e:
+                f_after = None
+                log.warning("future re-quote failed; snapshot flagged", product=spec.key,
+                            error=str(e))  # fmt: skip
     F = f_before if f_after is None else 0.5 * (f_before + f_after)
 
     option_rows: list[dict[str, Any]] = []
