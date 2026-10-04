@@ -46,3 +46,10 @@ def test_year_frac():
     assert year_frac(0, 0) == 1e-9
     assert year_frac(0, 365 * 86400 * 10**9) == pytest.approx(1.0, abs=1e-12)
     assert year_frac(10, 0) == 1e-9
+
+
+def test_local_black76_matches_pricing_module():
+    from bmm.spotcheck.vol import black76_call as local
+
+    for F, K, T, s in [(6500, 6500, 1 / 252, 0.16), (6500, 6560, 1 / 365, 0.2), (4000, 3900, 0.01, 0.3)]:
+        assert local(F, K, T, s) == pytest.approx(black76_call(F, K, T, s), abs=1e-9)

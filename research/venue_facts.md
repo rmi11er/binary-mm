@@ -56,6 +56,12 @@ Open items in this table keep the `[?]` tag with a `Searched:` list. Tracked in 
 | Incentives | [V] | CME Group runs an Event Contracts Market Maker Program (COMEX Submission 25-028 (4 of 4), filed 2025-01-10, modifications effective 2025-02-01): scope all Event Contracts traded on CME Globex; up to 7 participants chosen by Exchange staff, members or non-members, who must be proprietary trading firms located in the US, Singapore or Hong Kong and sign a contractual agreement; hours 7:00AM to 3:00PM CT and 5:00PM to 7:00AM CT; obligation to quote two-sided markets at predetermined average bid/ask spreads and minimum sizes for a percentage of time; incentive amounts are described only as predetermined and are not in the filing; program term started 2022-09-19 and ended 2025-07-31 unless extended or changed. A later filing titled Modifications to the Event Contracts Market Maker Program (Submission 26-198, 2026-04-15) appears in a CME filing index search excerpt but its text was not read; COMEX Event Contracts cash-settlement fee waiver extended to 2026-01-31 (search excerpt, [S]); the Event Contract Swaps program is separate. Underwrite no CME incentive income. | https://www.cftc.gov/sites/default/files/filings/orgrules/25/01/rules01102513644.pdf ; accessed 2026-10-03 |
 | Incentives, current terms | [?] | Current program terms unknown. Searched: CME and CFTC filings for the program, CME rule-filing index 2026 (fetch timed out), CME SERs, CME Globex notices, CME Client Systems wiki; no public per-product pool or score formula found. | https://www.cftc.gov/sites/default/files/filings/orgrules/25/01/rules01102513644.pdf ; accessed 2026-10-03 |
 
+## IBKR account (spotcheck safety)
+
+| Item | Status | Detail | Source |
+|---|---|---|---|
+| IBKR paper account id prefix | [?] | Paper accounts conventionally start with "DU"; spotcheck refuses non-DU accounts (fail closed). Not verified from a primary source. Searched: none yet | — |
+
 ## Other venues (context; not in scope for v1)
 
 - **Gemini Predictions** [V]: maker rebate = rebate_rate × taker_rate × C × P(1−P). The rebate rate fell to 0.30 across categories from 2026-06-11. Gemini also runs daily USD **Liquidity Rewards** pools scored on quote uptime, spread and size, with API endpoints for config and payouts.

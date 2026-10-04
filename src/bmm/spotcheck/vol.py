@@ -6,10 +6,22 @@ import math
 
 from scipy.optimize import brentq
 
-from bmm.pricing import black76_call
 from bmm.spotcheck.analyze import OptQuote
 
 _LO, _HI = 1e-4, 5.0
+
+
+def _ncdf(x: float) -> float:
+    return 0.5 * math.erfc(-x / math.sqrt(2.0))
+
+
+def black76_call(F: float, K: float, T: float, sig: float) -> float:
+    """Undiscounted Black-76 call. Local copy: importing bmm.pricing would pull in
+    bmm.pricing.quoting (order construction) via the package __init__, which the spotcheck
+    must never load. Equality with bmm.pricing.black76_call is pinned in test_vol.py."""
+    v = sig * math.sqrt(T)
+    d1 = (math.log(F / K) + 0.5 * v * v) / v
+    return F * _ncdf(d1) - K * _ncdf(d1 - v)
 
 
 def implied_vol(F: float, K: float, T: float, price: float) -> float | None:
