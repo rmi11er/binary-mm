@@ -50,7 +50,8 @@ FUTURES_SCHEMA: dict[str, Any] = {
     "bid_size": pl.Int64,
     "ask_size": pl.Int64,
     "last": pl.Float64,
-    "fut_ts_ns": pl.Int64,  # when the first future quote was taken
+    "fut_before_ts_ns": pl.Int64,  # first future quote (before the ladder once cached)
+    "fut_ts_ns": pl.Int64,  # re-quote completed (== fut_before_ts_ns if no re-quote)
     "und_px_before": pl.Float64,  # future mid before the option fetch
     "und_px_after": pl.Float64,  # future mid re-quoted after the option fetch
     "df_flag": pl.Boolean,  # |dF| x digital delta > 1c (or late future); null = unknown

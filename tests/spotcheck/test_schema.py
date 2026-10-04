@@ -49,6 +49,7 @@ GOLDEN_FUTURES = {
     "bid_size": pl.Int64,
     "ask_size": pl.Int64,
     "last": pl.Float64,
+    "fut_before_ts_ns": pl.Int64,
     "fut_ts_ns": pl.Int64,
     "und_px_before": pl.Float64,
     "und_px_after": pl.Float64,

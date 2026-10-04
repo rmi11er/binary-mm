@@ -145,14 +145,20 @@ async def collect_once(
     log: Any = None,
     clock: Callable[[], int] | None = None,
     sigma_memo: dict[str, float] | None = None,
+    fut_memo: dict[str, tuple[list[dict[str, Any]], FutQuote]] | None = None,
 ) -> None:
     """One snapshot for one product. Raises SourceError/ScaleError/timeouts; writes nothing then.
 
     `ts_ns` is the slot time. The ladder, the future and the options are fetched one after the
     other, so each table records when its own fetch completed (`clock`), the future is re-quoted
-    after the options, and F is the mean of the two. `df_flag` marks a snapshot where the move
+    after the options, and F is the mean of the two. From the second snapshot of a product the
+    resolved future is cached (`fut_memo`) and quoted BEFORE the ladder, so the two quotes bracket
+    the ladder and the options; on the first snapshot the ladder is needed to resolve the future
+    and the 5 s ladder-to-future gate applies. A changed future contract (roll) drops the cache and
+    the snapshot restarts as a first snapshot. If the re-quote fails or has no price,
+    `und_px_after` is None and `df_flag` is null. `df_flag` marks a snapshot where the move
     between the two quotes times the digital delta at the ATM ladder strike exceeds 1c. The delta
-    uses T to the venue fix and the chain's ATM sigma, or the product's last resolved sigma
+    uses T to the venue fix and the matched chain's ATM sigma (else the first resolved chain's), or the product's last resolved sigma
     (`sigma_memo`) if this snapshot's did not resolve; with neither, `df_flag` is null and metrics
     treat the snapshot as flagged. The flag is also set when the future was quoted more than 5 s
     after the ladder (the future cannot bracket the ladder then). Post-fix it is False.
@@ -160,12 +166,28 @@ async def collect_once(
     log = log or structlog.get_logger()
     now = clock or (lambda: ts_ns)
     fix_ts = ct_to_ns(question_date, *spec.fix_ct)
-    quotes, details = await source.ladder(spec, question_date)
-    ladder_ts = now()
+    cached = fut_memo.get(spec.key) if fut_memo is not None else None
+    if cached is not None:
+        fut = await source.reference_future(spec, question_date, cached[0], gc_month)
+        fut_before_ts = now()
+        f_before = _mid(fut, spec, log)
+        if fut.con_id != cached[1].con_id:
+            assert fut_memo is not None
+            log.warning("reference future changed; cache dropped", product=spec.key)
+            del fut_memo[spec.key]
+            return await collect_once(
+                source, spec, question_date, sink, snapshot_id, ts_ns, gc_month, write_details,
+                log, clock, sigma_memo, fut_memo,
+            )  # fmt: skip
+        quotes, details = await source.ladder(spec, question_date)
+        ladder_ts = now()
+    else:
+        quotes, details = await source.ladder(spec, question_date)
+        ladder_ts = now()
+        fut = await source.reference_future(spec, question_date, details, gc_month)
+        fut_before_ts = now()
+        f_before = _mid(fut, spec, log)
     ladder_rows = _ladder_rows(spec, quotes, snapshot_id, ts_ns, question_date, fix_ts, ladder_ts)
-    fut = await source.reference_future(spec, question_date, details, gc_month)
-    fut_ts = now()
-    f_before = _mid(fut, spec, log)
     fq = fut.quote
 
     # vanilla chains only: never the venue's own event-contract class nor any EC* class
@@ -220,25 +242,35 @@ async def collect_once(
                 continue
             chains.append((expiry, role, chain, now()))
 
-    f_after = f_before
+    f_after: float | None = f_before
+    fut_ts = fut_before_ts
     if chains:
         try:
-            f_after = _mid(
-                await source.reference_future(spec, question_date, details, gc_month), spec, log
-            )
+            fut2 = await source.reference_future(spec, question_date, details, gc_month)
+            if fut2.con_id != fut.con_id and cached is not None:
+                assert fut_memo is not None
+                log.warning("reference future changed; cache dropped", product=spec.key)
+                del fut_memo[spec.key]
+                return await collect_once(
+                    source, spec, question_date, sink, snapshot_id, ts_ns, gc_month,
+                    write_details, log, clock, sigma_memo, fut_memo,
+                )  # fmt: skip
+            f_after = _mid(fut2, spec, log)
+            fut_ts = now()
         except CAUGHT as e:
-            log.warning("future re-quote failed; using the first quote", product=spec.key,
+            f_after = None
+            log.warning("future re-quote failed; snapshot flagged", product=spec.key,
                         error=str(e))  # fmt: skip
-    F = 0.5 * (f_before + f_after)
+    F = f_before if f_after is None else 0.5 * (f_before + f_after)
 
     option_rows: list[dict[str, Any]] = []
-    sigmas: list[float] = []
+    sigmas: list[tuple[str, float]] = []
     atm_k = min((r["strike"] for r in ladder_rows), key=lambda k: abs(k - F))
     for expiry, role_s, chain, opt_ts in chains:
         T = year_frac(ts_ns, expiry.expiry_ts_ns)
         sigma = atm_sigma(chain, F, T)
         if sigma is not None:
-            sigmas.append(sigma)
+            sigmas.append((role_s, sigma))
         for c in sorted(chain, key=lambda c: c.strike):
             option_rows.append({
                 "snapshot_id": snapshot_id, "ts_ns": ts_ns, "product": spec.key,
@@ -250,15 +282,18 @@ async def collect_once(
                 "call_ask_size": getattr(c, "call_ask_size", None),
                 "opt_ts_ns": opt_ts, "und_px": F, "atm_sigma": sigma,
             })  # fmt: skip
-    if sigma_memo is not None and sigmas:
-        sigma_memo[spec.key] = sigmas[0]
-    sig_use = sigmas[0] if sigmas else (sigma_memo or {}).get(spec.key)
+    # delta sigma: the matched chain's, else the first resolved chain's, else the last resolved
+    matched_sig = next((v for r, v in sigmas if r == "match"), None)
+    resolved = matched_sig if matched_sig is not None else (sigmas[0][1] if sigmas else None)
+    if sigma_memo is not None and resolved is not None:
+        sigma_memo[spec.key] = resolved
+    sig_use = resolved if resolved is not None else (sigma_memo or {}).get(spec.key)
     df_flag: bool | None
     if ts_ns >= fix_ts:
         df_flag = False  # settled: the ladder is no longer compared with the surface
-    elif fut_ts - ladder_ts > MAX_LADDER_FUT_NS:
-        df_flag = True
-    elif sig_use is None:
+    elif cached is None and fut_before_ts - ladder_ts > MAX_LADDER_FUT_NS:
+        df_flag = True  # first snapshot only: the ladder was needed to resolve the future
+    elif f_after is None or sig_use is None:
         df_flag = None  # cannot size the move; metrics treat null as flagged
     else:
         dlt = digital_delta(F, atm_k, sig_use, year_frac(ts_ns, fix_ts))
@@ -270,10 +305,12 @@ async def collect_once(
         "snapshot_id": snapshot_id, "ts_ns": ts_ns, "product": spec.key, "con_id": fut.con_id,
         "local_symbol": fut.local_symbol, "contract_month": fut.contract_month,
         "bid": fq.bid, "ask": fq.ask, "bid_size": fq.bid_size, "ask_size": fq.ask_size,
-        "last": fq.last, "fut_ts_ns": fut_ts, "und_px_before": f_before,
+        "last": fq.last, "fut_before_ts_ns": fut_before_ts, "fut_ts_ns": fut_ts, "und_px_before": f_before,
         "und_px_after": f_after, "df_flag": df_flag,
     }  # fmt: skip
 
+    if fut_memo is not None:
+        fut_memo[spec.key] = (details, fut)
     sink.append(question_date, "ladder", ladder_rows)
     sink.append(question_date, "futures", [fut_row])
     if option_rows:
@@ -305,6 +342,7 @@ async def collect(
     oks = dict.fromkeys(specs, 0)
     last_err = dict.fromkeys(specs, "")
     sigma_memo: dict[str, float] = {}
+    fut_memo: dict[str, tuple[list[dict[str, Any]], FutQuote]] = {}
     active = set(specs)
     while active:
         slots: dict[str, int] = {}
@@ -328,7 +366,7 @@ async def collect(
                 await collect_once(
                     source, specs[k], question_date, sink, f"{k}-{ts}", ts, gc_month,
                     write_details=oks[k] == 0, log=log, clock=clock,
-                    sigma_memo=sigma_memo,
+                    sigma_memo=sigma_memo, fut_memo=fut_memo,
                 )  # fmt: skip
             except SafetyError:
                 raise  # never swallowed: it ends the session

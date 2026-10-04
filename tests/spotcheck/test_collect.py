@@ -301,7 +301,8 @@ def test_each_table_records_its_own_fetch_time(tmp_path):
     first = lad.filter(pl.col("snapshot_id") == lad["snapshot_id"][0])
     assert first["ladder_ts_ns"][0] - first["ts_ns"][0] == 3 * 10**9
     f0 = fut.filter(pl.col("snapshot_id") == lad["snapshot_id"][0])
-    assert f0["fut_ts_ns"][0] - f0["ts_ns"][0] == 6 * 10**9
+    assert f0["fut_before_ts_ns"][0] - f0["ts_ns"][0] == 6 * 10**9
+    assert f0["fut_ts_ns"][0] - f0["ts_ns"][0] == 9 * 10**9  # the re-quote
 
 
 def test_atm_sigma_unresolved_still_fetches_ladder_range(tmp_path):
@@ -440,5 +441,218 @@ def test_late_future_quote_flags_the_snapshot(tmp_path):
     inner = FixtureSource.from_json(SESSION, clock=vc)
     asyncio.run(collect(SlowFut(inner, vc), [PRODUCTS["forecastex-spx"]], D,
                         ParquetSink(tmp_path), vc, vc.sleep))  # fmt: skip
+    fut = _read(tmp_path, "futures").sort("ts_ns")
+    pre = fut.filter(pl.col("ts_ns") < FIX)
+    assert pre["df_flag"][0] is True  # first snapshot: future quoted 6 s after the ladder
+    assert not pre["df_flag"][1:].any()  # cached: quoted before the ladder, no gate
+
+
+# --- pre-merge part 1 ----------------------------------------------------------------------------
+class Recorder:
+    """Records the order of source calls for one product."""
+
+    def __init__(self, inner, log):
+        self.inner, self.log = inner, log
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def ladder(self, *a):
+        self.log.append("ladder")
+        return await self.inner.ladder(*a)
+
+    async def reference_future(self, *a):
+        self.log.append("future")
+        return await self.inner.reference_future(*a)
+
+    async def option_expiries(self, *a, **k):
+        self.log.append("expiries")
+        return await self.inner.option_expiries(*a, **k)
+
+    async def calls(self, *a):
+        self.log.append("calls")
+        return await self.inner.calls(*a)
+
+
+def _order(log):
+    out = []
+    for x in log:
+        if x == "calls" and out and out[-1] == "calls":
+            continue  # many strike batches per chain
+        out.append(x)
+    return out
+
+
+def test_future_quoted_before_ladder_from_second_snapshot(tmp_path):
+    log: list[str] = []
+    go(lambda s: Recorder(s, log), products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    # snapshot 1 (unchanged): ladder, future, expiries, calls..., future
+    assert _order(log)[:5] == ["ladder", "future", "expiries", "calls", "future"]
+    # snapshot 2: future, ladder, expiries, calls..., future
+    assert _order(log)[5:10] == ["future", "ladder", "expiries", "calls", "future"]
     fut = _read(tmp_path, "futures")
-    assert fut.filter(pl.col("ts_ns") < FIX)["df_flag"].all()
+    assert (fut["fut_before_ts_ns"] <= fut["fut_ts_ns"]).all()
+
+
+def test_first_snapshot_keeps_the_ladder_to_future_gate(tmp_path):
+    class SlowFut:
+        def __init__(self, inner, vc):
+            self.inner, self.vc = inner, vc
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            self.vc.t += 6 * 10**9
+            return await self.inner.reference_future(*a)
+
+    vc = VClock(ct(11, 30))
+    inner = FixtureSource.from_json(SESSION, clock=vc)
+    asyncio.run(collect(SlowFut(inner, vc), [PRODUCTS["forecastex-spx"]], D,
+                        ParquetSink(tmp_path), vc, vc.sleep))  # fmt: skip
+    fut = _read(tmp_path, "futures").sort("ts_ns")
+    assert fut["df_flag"][0] is True  # first snapshot: gate applies (ladder before future)
+    # later snapshots quote the future before the ladder: the 5 s gate does not apply
+    assert fut.filter(pl.col("ts_ns") < FIX - 3600 * 10**9)["df_flag"][1:].any() is False
+
+
+def test_roll_invalidates_cached_future(tmp_path):
+    class Roll:
+        """From the third future quote on, the reference future is a different contract."""
+
+        def __init__(self, inner):
+            self.inner, self.n = inner, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            from dataclasses import replace
+
+            f = await self.inner.reference_future(*a)
+            self.n += 1
+            return replace(f, con_id=f.con_id + 1) if self.n >= 3 else f
+
+    log: list[str] = []
+    _, status = go(lambda s: Recorder(Roll(s), log), products=[PRODUCTS["forecastex-spx"]],
+                   tmp=tmp_path)  # fmt: skip
+    assert status == {"forecastex-spx": "ok"}
+    # snapshot 2 (cache hit) sees con_id change on its before-quote: cache dropped, restarted as a
+    # first snapshot (ladder before future)
+    o = _order(log)
+    assert o[5:8] == ["future", "ladder", "future"]  # dropped before-quote, then first-style order
+    assert o[8] == "expiries"
+    fut = _read(tmp_path, "futures")
+    assert fut["snapshot_id"].n_unique() == 97  # every snapshot written exactly once
+
+
+def test_matched_chain_sigma_preferred_for_df_flag(tmp_path, monkeypatch):
+    """chosen = [below (sigma 0.30), match (sigma 0.15)]: the delta must use 0.15."""
+    from bmm.spotcheck import collect as C
+    from bmm.spotcheck.contracts import ExpiryMatch, OptExpiry
+    from bmm.spotcheck.source import SizedOptQuote
+
+    fix = ct(15, 0)
+    below = OptExpiry(fix - 600 * 10**9, 1001, "ES", "20261005")
+    match = OptExpiry(fix, 1001, "ES", "20261005")
+    seen: list[float] = []
+    real = C.digital_delta
+
+    class Two:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def option_expiries(self, spec, fut, qd=None):
+            return [below, match]
+
+        async def listed_strikes(self, spec, expiry):
+            return await self.inner.listed_strikes(spec, match)
+
+        async def calls(self, spec, expiry, strikes):
+            out = await self.inner.calls(spec, match, strikes)
+            tag = 1 if expiry == below else 2
+            return [SizedOptQuote(q.strike, q.call_bid, q.call_ask, tag, tag) for q in out]
+
+    monkeypatch.setattr(
+        C, "match_expiry", lambda *a, **k: ExpiryMatch([(below, "below"), (match, "match")], False)
+    )
+    monkeypatch.setattr(
+        C, "atm_sigma", lambda chain, F, T: 0.30 if chain[0].call_bid_size == 1 else 0.15
+    )
+    monkeypatch.setattr(
+        C, "digital_delta", lambda F, K, sigma, T: (seen.append(sigma), real(F, K, sigma, T))[1]
+    )
+    _, status = go(Two, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert status == {"forecastex-spx": "ok"}
+    assert seen and set(seen) == {0.15}
+
+
+def test_sigma_falls_back_to_first_resolved_when_match_unresolved(tmp_path, monkeypatch):
+    from bmm.spotcheck import collect as C
+    from bmm.spotcheck.contracts import ExpiryMatch, OptExpiry
+    from bmm.spotcheck.source import SizedOptQuote
+
+    fix = ct(15, 0)
+    below = OptExpiry(fix - 600 * 10**9, 1001, "ES", "20261005")
+    match = OptExpiry(fix, 1001, "ES", "20261005")
+    seen: list[float] = []
+    real = C.digital_delta
+
+    class Two:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def option_expiries(self, spec, fut, qd=None):
+            return [below, match]
+
+        async def listed_strikes(self, spec, expiry):
+            return await self.inner.listed_strikes(spec, match)
+
+        async def calls(self, spec, expiry, strikes):
+            out = await self.inner.calls(spec, match, strikes)
+            tag = 1 if expiry == below else 2
+            return [SizedOptQuote(q.strike, q.call_bid, q.call_ask, tag, tag) for q in out]
+
+    monkeypatch.setattr(
+        C, "match_expiry", lambda *a, **k: ExpiryMatch([(below, "below"), (match, "match")], False)
+    )
+    monkeypatch.setattr(
+        C, "atm_sigma", lambda chain, F, T: 0.30 if chain[0].call_bid_size == 1 else None
+    )
+    monkeypatch.setattr(
+        C, "digital_delta", lambda F, K, sigma, T: (seen.append(sigma), real(F, K, sigma, T))[1]
+    )
+    go(Two, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert seen and set(seen) == {0.30}
+
+
+def test_failed_requote_sets_after_none_and_flags_null(tmp_path):
+    class FailSecond:
+        """The re-quote (second future call per snapshot) raises."""
+
+        def __init__(self, inner):
+            self.inner, self.n = inner, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            self.n += 1
+            # snapshot 1: calls 1 (resolve) and 2 (re-quote); later snapshots: before, after
+            if self.n % 2 == 0:
+                raise SourceError("no price")
+            return await self.inner.reference_future(*a)
+
+    _, status = go(FailSecond, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert status == {"forecastex-spx": "ok"}
+    fut = _read(tmp_path, "futures")
+    pre = fut.filter(pl.col("ts_ns") < FIX)
+    assert pre["und_px_after"].null_count() == pre.height
+    assert pre["df_flag"].null_count() == pre.height
+    assert (pre["und_px_before"].is_not_null()).all()
