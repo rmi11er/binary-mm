@@ -47,13 +47,16 @@ class Alloc:
 def shrink_markout(
     m_mkt: float | None, n: int, m_cat: float | None, n0: int = N0
 ) -> tuple[float, bool]:
-    """Shrink the market markout toward the category mean. Returns (markout, lower_bound_flag)."""
-    if m_cat is None:
-        return (m_mkt, False) if m_mkt is not None else (0.0, True)
-    if m_mkt is None or n <= 0:
-        return m_cat, False
-    w = min(n, n0) / n0
-    return w * m_mkt + (1 - w) * m_cat, False
+    """Shrink the market markout toward a prior. Returns (markout, lower_bound_flag).
+
+    The prior is the category mean; the caller falls back to the all-category mean first. With
+    no prior at all it is 0 (no adverse selection), so the result is only a cost lower bound
+    and is flagged whenever that prior carries weight.
+    """
+    w = 0.0 if m_mkt is None or n <= 0 else min(n, n0) / n0
+    prior = 0.0 if m_cat is None else m_cat
+    m = prior if m_mkt is None else w * m_mkt + (1 - w) * prior
+    return m, (m_cat is None and w < 1)
 
 
 def cost_hr(
@@ -64,7 +67,11 @@ def cost_hr(
     maker_rebate: float,
     coll: float,
 ) -> float:
-    """f x cost_per_fill + collateral carry. m is the signed maker markout (negative = adverse)."""
+    """f x cost_per_fill + collateral carry. m is the signed maker markout (negative = adverse).
+
+    fills_side_hr counts contracts (not trades); depth_raw_side is the resting depth the fills
+    are shared with (queue-share approximation, our own size excluded, so f is overstated).
+    """
     f = fills_side_hr / max(depth_raw_side, 1.0)
     per_fill = max(0.0, max(0.0, -m) - maker_rebate + maker_fee)
     return f * per_fill + coll * COLL_RATE / HOURS_YR
@@ -75,7 +82,7 @@ def ev(h: Half, s: int) -> float:
 
 
 def _argmax_int(f: Callable[[int], float], lo: int, hi: int) -> int:
-    """Integer argmax of a unimodal f on [lo, hi] by ternary search."""
+    """Integer argmax of f on [lo, hi] by ternary search. Requires f strictly concave."""
     while hi - lo > 2:
         m1, m2 = lo + (hi - lo) // 3, hi - (hi - lo) // 3
         if f(m1) < f(m2):
@@ -86,6 +93,7 @@ def _argmax_int(f: Callable[[int], float], lo: int, hi: int) -> int:
 
 
 def s_star(h: Half, s_cap: int) -> int:
+    """Best size for one half-market. `reward` must be concave with reward(0) = 0."""
     if h.q > s_cap:
         return 0
     if h.s_star_cf is not None and math.isfinite(h.s_star_cf):
@@ -104,19 +112,39 @@ def _alloc(h: Half, n: int) -> Alloc:
     return Alloc(h.key, n, rd, cd, col, (rd - cd) / col if col else 0.0, h.c_lower_bound)
 
 
+def _group_of(h: Half) -> str:
+    return h.market if h.two_sided else h.key
+
+
 def allocate(
     halves: list[Half], budget: float = 8000.0, mkt_cap: float = 0.15, venue_cap: float = 0.40
 ) -> list[Alloc]:
+    """Greedy plus one improvement pass: for each funded group, drop it, refill greedily and keep
+    the best total EV. Exact for unit blocks with concave rewards; a heuristic when q > 1."""
+    best = _greedy(halves, budget, mkt_cap, venue_cap)
+
+    def total(al: list[Alloc]) -> float:
+        return sum(a.reward_day - a.cost_day for a in al)
+
+    for g in sorted({_group_of(h) for h, a in zip(halves, best, strict=True) if a.s > 0}):
+        trial = _greedy([h for h in halves if _group_of(h) != g], budget, mkt_cap, venue_cap)
+        if total(trial) > total(best) + EPS:
+            by_key = {a.key: a for a in trial}
+            best = [by_key.get(h.key, _alloc(h, 0)) for h in halves]
+    return best
+
+
+def _greedy(halves: list[Half], budget: float, mkt_cap: float, venue_cap: float) -> list[Alloc]:
     """Greedy by marginal EV per collateral $. Qualifying blocks go in whole (both sides together
-    for two-sided programs). Heuristic when q > 1; exact for unit blocks with concave rewards."""
+    for two-sided programs, which are skipped unless both halves are present)."""
     by = {h.key: h for h in halves}
     s = {h.key: 0 for h in halves}
     groups: dict[str, list[Half]] = {}
     for h in halves:
-        groups.setdefault(h.market if h.two_sided else h.key, []).append(h)
+        groups.setdefault(_group_of(h), []).append(h)
     smax: dict[str, int] = {}
     for h in halves:
-        st = s_star(h, int(mkt_cap * budget // h.coll))
+        st = s_star(h, math.floor(mkt_cap * budget / h.coll + 1e-9))
         smax[h.key] = max(st, h.q) if h.two_sided else st
     used = 0.0
     vused: defaultdict[str, float] = defaultdict(float)
@@ -124,6 +152,8 @@ def allocate(
     heap: list[tuple[float, int, str, str | None]] = []
     seq = itertools.count()
     for g, hs in groups.items():
+        if hs[0].two_sided and len(hs) < 2:
+            continue
         if not hs[0].two_sided and smax[hs[0].key] == 0:
             continue
         bev = sum(ev(h, h.q) for h in hs)

@@ -29,6 +29,9 @@ def test_shrink_markout():
     assert shrink_markout(-0.04, 5, -0.01) == (pytest.approx(0.25 * -0.04 + 0.75 * -0.01), False)
     assert shrink_markout(None, 0, -0.01) == (pytest.approx(-0.01), False)
     assert shrink_markout(None, 0, None) == (0.0, True)
+    # no category prior: shrink toward 0 and flag (one lucky trade must not erase adverse cost)
+    assert shrink_markout(0.10, 1, None) == (pytest.approx(0.005), True)
+    assert shrink_markout(-0.04, 25, None) == (pytest.approx(-0.04), False)
 
 
 def test_numeric_s_star_matches_bruteforce():
@@ -92,3 +95,33 @@ def test_two_sided_block_all_or_nothing():
 def test_lower_bound_flag_passthrough():
     (a,) = allocate([H(c_lower_bound=True)])
     assert a.c_lower_bound
+
+
+def test_improvement_pass_beats_lumpy_greedy():
+    def step(q, v):
+        return lambda s: v if s >= q else 0.0
+
+    hs = [
+        H(key="A:bid", market="A", reward=step(6, 6.06), c=1e-9, coll=1.0, q=6),
+        H(key="B:bid", market="B", reward=step(5, 5.0), c=1e-9, coll=1.0, q=5),
+        H(key="C:bid", market="C", reward=step(5, 5.0), c=1e-9, coll=1.0, q=5),
+    ]
+    out = {a.key: a.s for a in allocate(hs, budget=10, mkt_cap=1, venue_cap=1)}
+    assert out == {"A:bid": 0, "B:bid": 5, "C:bid": 5}
+
+
+def test_two_sided_single_half_is_skipped():
+    assert allocate([H(two_sided=True, q=5)])[0].s == 0
+
+
+def test_market_cap_floor_has_no_float_off_by_one():
+    h = H(reward=pr(1e6, 10.0), c=1e-9, coll=0.1)
+    assert allocate([h])[0].s == 12000  # 0.15 * 8000 / 0.1
+
+
+def test_alloc_units_are_per_day():
+    h = H()
+    (a,) = allocate([h])
+    assert a.reward_day == pytest.approx(24 * h.reward(a.s))
+    assert a.cost_day == pytest.approx(24 * h.c * a.s)
+    assert a.roc_day == pytest.approx((a.reward_day - a.cost_day) / (a.s * h.coll))
