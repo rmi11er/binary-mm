@@ -224,9 +224,11 @@ def analyze(
         )
         an.halves.append((h, r))
         an.info[key], an.markout[key], an.stress_per[key] = r, (m, src), sp
-        an.flags[key] = (["mk:proxied"] if "proxied" in src else []) + (
-            ["fills:proxied"] if r.get("fills_proxied") else []
-        )
+        an.flags[key] = (
+            ["mk:proxied"]
+            if src.startswith(("proxied", "vol-proxy", "blend:proxied", "blend:vol-proxy"))
+            else []
+        ) + (["fills:proxied"] if r.get("fills_proxied") else [])
 
     blocked_markets: set[tuple[str, str]] = set()
     eligible: list[tuple[Half, dict[str, Any]]] = []

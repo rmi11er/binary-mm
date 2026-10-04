@@ -59,3 +59,10 @@ Live in-game sports; crypto with < 24h to expiry; `top_holder_share > 0.5` at th
 ## Safety acceptance
 - One parametrized no-order-surface test, reusing `tests/spotcheck/test_safety.py::scan`, over `spotcheck` and `scan`. For `scan` it adds a rule forbidding HTTP POST/PUT/PATCH/DELETE, `/order(s)` paths (`orderbook` allowed) and auth headers.
 - One port/env test: refuses `BMM_MODE=live`, `scan/` never imports `ib_async`, and the HTTP client rejects hosts outside the allowlist.
+
+## Iteration 2 (proxied inputs, cadence, stress)
+- **Proxied inputs, always flagged (`mk:proxied`, `fills:proxied`):** on first sight of a market the scanner backfills 7 days. Kalshi uses its trade tape (mid proxy = 5-min last trade). Polymarket US uses `/v1/price-history` (1d at 5-min, 1w at 3h; mid = (long + 1 − short)/2). It has no tape, so its markout is `−λ·mean|30m mid move|`, with λ calibrated on Kalshi and clamped to [0.05, 1]. Its fill rate comes from `sharesTraded` deltas (gap ≥ 1h), else the lifetime average since `openSetTime`, halved per side. The organic markout is shrunk toward the proxied prior with weight min(n,20)/20, so organic data takes over as it accrues.
+- **Cadence:** the hourly tier fetches terms, universe, meta, books and trades for all markets and rewrites the `ranking` table. The 5-minute tier fetches books and trades for the top 40 markets in that ranking (standalone net $/day), reusing stored terms and meta. Venues and markets run concurrently, paced per host. Target: fast tier < 90 s.
+- **Stress:** `stress_loss = size × adverse_jump`. `jump_class = high` (politics, geopolitics, news-driven wording) uses the full distance to 0 (bid) or 1 (ask). Otherwise it is min(empirical 99th pct 1h move, distance), or the distance if unknown. Caps: ≤ 2% of bankroll per market and ≤ 10% in total, with bankroll = the $8k budget. The report shows stress per position.
+- **Taxonomy:** `geopolitics` (hormuz, strait, war, sanctions, …) and `politics` carry `jump_class = high`; "hormuz" is no longer energy.
+- **Gemini:** scanned and reported, but not allocated while `pool_scope_verified = false` in `config/scan_venues.toml`.
