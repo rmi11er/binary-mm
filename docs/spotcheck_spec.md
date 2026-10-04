@@ -1,3 +1,17 @@
+> **Status: parked (2026-10-04).** Merged to `main` without a live run. Reviews: risk-auditor round 2 **APPROVE**; quant-reviewer round 2 **PASS-WITH-NITS** (round 1 files in `docs/reviews/`).
+>
+> Owner-listed ledger items, all **already implemented** on this branch (not open):
+> - future quoted before the ladder (127f714)
+> - matched-chain sigma preferred (127f714)
+> - failed future re-quote flagged as null/non-simultaneous (127f714)
+> - `ib_async>=2.1,<3` cap (127f714)
+> - non-simultaneous bucket with delta-widened fair band (55997fe; reworked in 350f4b4 so non-sim snapshots count toward persistence via `gap_outside`)
+>
+> Still open (from round-2 reviews; fix before the first live session):
+> - **Important:** `metrics._volume_steps` fills null volume with 0, so a single missing volume reading creates a phantom post-fix trade in §6. Fix: forward-fill within (product, fix, strike).
+> - Minor: stale §2/§5/rule.py docstring wording after the persistence rework; metrics' `sim_bucket` recompute ignores the first-snapshot ladder-before-future gap; `px_vs_outcome` should be null within 2 ticks of the strike; the cached expiry list keeps a dropped expiry for the whole session; the latency test sits exactly on `GO_MIN_PERSISTENCE`; a nested `getattr(..., "conn")` raw-socket path escapes the scan and the send guard; the send-guard pass-through test covers one message id only; `reports/*.md` not ignored.
+> - Owner decisions: should the verdict label's gap clauses use the adjusted series (simultaneous rows skew toward calm periods)? Should tick-floor wing rows be excluded from the rule? Where does the `[?]` ForecastEx YES/NO trade-visibility row belong in `research/venue_facts.md`? Plus the pre-run confirmations: IB symbols and vanilla option classes, FORECASTX data on paper, fix times (owner item #7), DU account prefix.
+
 # Spot-check spec: are venue binaries mispriced vs the options surface by more than fees?
 
 One-off, outside the phase rollout. **Market data only: no order code may be imported or called.**
