@@ -13,7 +13,7 @@ A YES contract on "F_T > K" is a digital call. NO = df - YES.
 from __future__ import annotations
 
 import math
-from typing import Callable
+from collections.abc import Callable
 
 from scipy.stats import norm
 

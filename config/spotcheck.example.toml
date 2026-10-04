@@ -1,0 +1,56 @@
+# Spotcheck product specs (market data only). Mirrors the defaults in
+# src/bmm/spotcheck/contracts.py; any value here overrides the default.
+# NOTE: ib_symbol / trading_class / exchange mappings are NOT yet confirmed against a live IB
+# contract lookup. Confirm on first connect (research/venue_facts.md marks IB access as [S]).
+# Option chains used as the "fair" surface ALWAYS exclude the product's own trading_class and any
+# class starting with "EC" (event contracts expire at the fix and price at the binary itself).
+# opt_trading_classes = [] means any other class; set e.g. ["OG"] to pin the vanilla class.
+# The vanilla class names below are NOT guessed: confirm them on the first paper connect.
+# This file never sets ports or modes; the port allowlist (4002 only) lives in safety.py.
+
+[products.forecastex-spx]
+ib_symbol = "FES"            # venue_facts "Financial products" [V]: FES (US 500), CFTC T&C May 2025
+ib_sec_type = "OPT"          # venue_facts "API access" [S]: ForecastEx modelled as OPT
+ib_exchange = "FORECASTX"    # venue_facts "API access" [S]
+fut_symbol = "ES"            # venue_facts "S&P reference" [V]: CME E-mini S&P 500 futures
+fut_exchange = "CME"         # venue_facts "S&P reference" [V]
+opt_exchange = "CME"         # options on the reference future listed on CME (to confirm on first connect)
+fix_ct = [15, 0]             # venue_facts "S&P reference" [V]: last trading time 3:00 PM CT
+payout_scale = 1.0           # venue_facts "Tick / payout" [V]: $1.00 payout
+ref_rule = "lead_quarterly"  # venue_facts "S&P reference" [V]: lead month, second month on final settlement day
+
+[products.forecastex-ndx]
+ib_symbol = "FNQ"            # venue_facts "Financial products" [V]: FNQ
+ib_sec_type = "OPT"          # venue_facts "API access" [S]
+ib_exchange = "FORECASTX"    # venue_facts "API access" [S]
+fut_symbol = "NQ"            # venue_facts "NDX reference" [V]: CME E-mini Nasdaq-100 futures
+fut_exchange = "CME"         # venue_facts "NDX reference" [V]
+opt_exchange = "CME"         # to confirm on first connect
+fix_ct = [15, 0]             # ASSUMED same as S&P; NQ settlement window is [?] in venue_facts "NQ EC settlement window"
+payout_scale = 1.0           # venue_facts "Tick / payout" [V]
+ref_rule = "lead_quarterly"  # venue_facts "NDX reference" [V]
+
+[products.forecastex-gold]
+ib_symbol = "METLG"          # venue_facts "Gold reference" [V]: product code METLG
+ib_sec_type = "OPT"          # venue_facts "API access" [S]
+ib_exchange = "FORECASTX"    # venue_facts "API access" [S]
+fut_symbol = "GC"            # venue_facts "Gold reference" [V]: gold futures contract named in the question
+fut_exchange = "COMEX"       # COMEX gold futures (to confirm on first connect)
+opt_exchange = "COMEX"       # to confirm on first connect
+fix_ct = [12, 30]            # venue_facts "Gold reference" [V]: last trading time 12:30 PM CT
+payout_scale = 1.0           # venue_facts "Tick / payout" [V]
+ref_rule = "named_gc"        # venue_facts "Gold reference" [V]: contract month is named in the question text
+# opt_trading_classes = ["OG"]  # vanilla COMEX gold options class: confirm on first paper connect
+
+[products.cme-gold]
+ib_symbol = "GC"             # venue_facts "Access" [S]: FOP, trading class ECGC; symbol to confirm on first connect
+ib_sec_type = "FOP"          # venue_facts "Access" [S]
+ib_exchange = "COMEX"        # venue_facts "Gold EC reference" [V]: COMEX Rulebook Chapter 23
+trading_class = "ECGC"       # venue_facts "Access" [S] and "Gold EC reference" [V]: Globex code ECGC
+fut_symbol = "GC"            # venue_facts "Gold EC reference" [V]: underlying COMEX Gold Futures (GC)
+fut_exchange = "COMEX"       # venue_facts "Gold EC reference" [V]
+opt_exchange = "COMEX"       # to confirm on first connect
+fix_ct = [12, 30]            # venue_facts "Gold EC settlement window" [S]: window 12:29:00 to 12:30:00 CT
+payout_scale = 1.0           # to confirm on first connect; ScaleError guards a $100 scale
+ref_rule = "under_con_id"    # the EC's own underlying future conId is the reference
+# opt_trading_classes = ["OG"]  # vanilla COMEX gold options class (ECGC is always excluded): confirm on first paper connect

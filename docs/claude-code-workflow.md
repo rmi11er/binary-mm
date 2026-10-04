@@ -47,23 +47,23 @@ You can pin full IDs instead of aliases (`model: claude-opus-5-5` / `claude-sonn
 
 **Phase 1 (recorder)**
 ```
-/goal All tasks in docs/plans/phase-1.md are checked off; `make check` exits 0 with output shown; `uv run pytest -q --cov=src/bmm/recorder` shows >= 90% coverage; a recorder dry-run against recorded fixtures produces all SPEC section 5 tables and a recorder_health.md, shown via `ls -R data/` and `cat` of the health report. No file under config/ other than *.example.toml is modified, no code connects to port 4001, and risk-auditor has returned APPROVE on src/bmm/gateway. Stop after 60 turns.
+/goal All tasks in docs/plans/phase-1.md are checked off; `make check` exits 0 with output shown; `uv run pytest -q --cov=src/bmm/recorder` shows >= 90% coverage; a recorder dry-run against recorded fixtures produces all docs/spec/10-recorder.md §5 tables and a recorder_health.md, shown via `ls -R data/` and `head -40` of the health report. No file under config/ other than *.example.toml is modified, no code connects to port 4001, and risk-auditor has returned APPROVE on src/bmm/gateway. Stop after 25 turns.
 ```
 (The 6-hour live-market-data soak is run by you on the VPS, not inside the goal.)
 
 **Phase 2 (fair value)**
 ```
-/goal docs/plans/phase-2.md tasks are complete; `make check` exits 0 (output shown); `uv run bmm price --replay <dates>` produces the fair table for every shortlisted contract on 3 recorded days with zero NaN rows (print the row and NaN counts); reports/anchor_vs_svi.md exists; quant-reviewer returns PASS or PASS-WITH-NITS with nits addressed. Stop after 50 turns.
+/goal docs/plans/phase-2.md tasks are complete; `make check` exits 0 (output shown); `uv run bmm price --replay <dates>` produces the fair table for every shortlisted contract on 3 recorded days with zero NaN rows (print the row and NaN counts); reports/anchor_vs_svi.md exists; quant-reviewer returns PASS or PASS-WITH-NITS with nits addressed. Stop after 25 turns.
 ```
 
 **Phase 3 (go/no-go analytics)**
 ```
-/goal reports/phase3_<date>.md exists and contains, for each shortlisted product: spread/depth by moneyness and time-to-resolution, trade frequency/size, competitor reaction latency, trade markouts at 1s/10s/60s/300s vs our fair, mid-vs-fair bias by moneyness, incentive pool share estimate, and a ranked recommendation with EV/day and confidence bands; data-validator reported PASS or WARN (not FAIL) on the input range; quant-reviewer returned PASS. Print the report headings and the validator verdict. Stop after 40 turns.
+/goal reports/phase3_<date>.md exists and contains, for each shortlisted product: spread/depth by moneyness and time-to-resolution, trade frequency/size, competitor reaction latency, trade markouts at 1s/10s/60s/300s vs our fair, mid-vs-fair bias by moneyness, incentive pool share estimate, and a ranked recommendation with EV/day and confidence bands; data-validator reported PASS or WARN (not FAIL) on the input range; quant-reviewer returned PASS. Print the report headings and the validator verdict. Stop after 25 turns.
 ```
 
 **Phase 4 (sim)**
 ```
-/goal `uv run bmm sim` runs on two disjoint recorded date ranges and writes reports/sim_<range>.md decomposing P&L into spread, incentives, markout cost and hedge cost; the fill model is trade-through-only (show the unit test proving a print AT our price does not fill); the report states whether positive P&L depends on incentives alone; quant-reviewer PASS. Stop after 50 turns.
+/goal `uv run bmm sim` runs on two disjoint recorded date ranges and writes reports/sim_<range>.md decomposing P&L into spread, incentives, markout cost and hedge cost; the fill model is trade-through-only (show the unit test proving a print AT our price does not fill); the report states whether positive P&L depends on incentives alone; quant-reviewer PASS. Stop after 25 turns.
 ```
 
 Phase 5+ (paper/shadow and live): **no /goal.** Run them interactively. These are the phases where an autonomous loop is the wrong tool.

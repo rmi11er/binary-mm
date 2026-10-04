@@ -1,0 +1,116 @@
+import sys
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from bmm.cli import main
+
+ROOT = Path(__file__).resolve().parents[1]
+SESSION = ROOT / "tests/fixtures/spotcheck/session.json"
+IBS = "bmm.spotcheck.ibsource"
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "err"),
+    [(["--port", "4001"], None, "REFUSED"), (["--host", "10.0.0.9"], None, None),
+     (["--client-id", "0"], None, "client id"), ([], "live", None)],
+    ids=["port", "host", "client_id", "live_mode"],
+)  # fmt: skip
+def test_guards_refuse_without_loading_ibsource(monkeypatch, capsys, argv, env, err):
+    monkeypatch.delitem(sys.modules, IBS, raising=False)
+    if env:
+        monkeypatch.setenv("BMM_MODE", env)
+    else:
+        monkeypatch.delenv("BMM_MODE", raising=False)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx", *argv]) == 3
+    assert IBS not in sys.modules
+    if err:
+        assert err in capsys.readouterr().err
+
+
+def test_fixture_run_writes_three_tables(tmp_path, monkeypatch):
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    rc = main(["spotcheck", "collect", "--fixture", str(SESSION), "--question-date", "2026-10-05",
+               "--out", str(tmp_path)])  # fmt: skip
+    assert rc == 0
+    day = tmp_path / "date=2026-10-05"
+    for t in ("ladder", "futures", "options"):
+        assert pl.read_parquet(day / f"{t}.parquet").height > 0
+
+
+def test_fixture_run_without_question_date_uses_session_date(tmp_path, monkeypatch):
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    assert main(["spotcheck", "collect", "--fixture", str(SESSION), "--product",
+                 "forecastex-gold", "--out", str(tmp_path)]) == 0  # fmt: skip
+    assert (tmp_path / "date=2026-10-05/ladder.parquet").exists()
+
+
+def test_all_products_failing_exits_2(tmp_path, monkeypatch):
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"question_date": "2026-10-05", "seed": 7, "products": {}}')
+    assert main(["spotcheck", "collect", "--fixture", str(empty), "--product", "forecastex-spx",
+                 "--out", str(tmp_path / "o")]) == 2  # fmt: skip
+
+
+def test_unknown_product_exits_2(tmp_path, monkeypatch):
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    assert main(["spotcheck", "collect", "--fixture", str(SESSION), "--product", "nope",
+                 "--out", str(tmp_path)]) == 2  # fmt: skip
+
+
+def test_live_flag_does_not_exist():
+    with pytest.raises(SystemExit) as e:
+        main(["spotcheck", "collect", "--live"])
+    assert e.value.code == 2
+
+
+def test_report_without_data_exits_2(capsys, tmp_path):
+    assert (
+        main(
+            [
+                "spotcheck",
+                "report",
+                "--from",
+                "2026-10-05",
+                "--to",
+                "2026-10-05",
+                "--data",
+                str(tmp_path / "none"),
+                "--out",
+                str(tmp_path / "r"),
+            ]
+        )
+        == 2
+    )
+    assert "no ladder data" in capsys.readouterr().err
+
+
+def test_dispatcher_usage(capsys):
+    assert main([]) == 2
+
+
+def test_safety_error_after_connect_exits_3(monkeypatch, capsys):
+    from bmm.spotcheck import ibsource
+    from bmm.spotcheck.safety import SafetyError
+
+    async def boom(*a, **k):
+        raise SafetyError("non-paper account")
+
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    monkeypatch.setattr(ibsource.IBSource, "connect", boom)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx"]) == 3
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_unexpected_exception_exits_2_with_error_line(monkeypatch, capsys):
+    from bmm.spotcheck import ibsource
+
+    async def boom(*a, **k):
+        raise KeyError("surprise")
+
+    monkeypatch.delenv("BMM_MODE", raising=False)
+    monkeypatch.setattr(ibsource.IBSource, "connect", boom)
+    assert main(["spotcheck", "collect", "--product", "forecastex-spx"]) == 2
+    assert "ERROR: KeyError" in capsys.readouterr().err

@@ -4,6 +4,7 @@ description: Validates recorded parquet data quality (gaps, timestamp monotonici
 tools: Read, Grep, Glob, Bash, Write
 model: sonnet
 ---
+Read ONLY the spec file you were given (normally `docs/spec/10-recorder.md` for schemas). Never cat parquet or logs; use summary scripts.
 Check for the given date range:
 - message gaps per source vs thresholds; timestamps monotone per source; ts_recv vs ts_exch skew
 - crossed/locked books, prices outside [0,1] for binaries, YES+NO mids far from 1
