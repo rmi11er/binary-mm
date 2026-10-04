@@ -165,8 +165,30 @@ def test_file_walk_is_not_vacuous():
     assert len(names) >= 7
 
 
-def test_no_order_surface_in_spotcheck():
-    assert scan(_files()) == []
+HTTP_FORBIDDEN = re.compile(
+    r"\.(post|put|patch|delete)\s*\(|/orders?\b(?!book)|Authorization|KALSHI-ACCESS"
+    r"|X-GEMINI-APIKEY|\.env\b"
+)
+PKGS = {
+    "spotcheck": (SPOT, None),
+    "scan": (ROOT / "src/bmm/scan", HTTP_FORBIDDEN),
+}
+
+
+@pytest.mark.parametrize("pkg", sorted(PKGS))
+def test_no_order_surface(pkg):
+    path, extra = PKGS[pkg]
+    files = sorted(path.rglob("*.py")) + [ROOT / "src/bmm/cli.py"]
+    assert len(files) >= 6, f"vacuous walk for {pkg}"
+    hits = scan(files)
+    if extra:
+        hits += [
+            f"{f.name}:{i}:http"
+            for f in files[:-1]
+            for i, line in enumerate(f.read_text().splitlines(), 1)
+            if extra.search(line)
+        ]
+    assert hits == []
 
 
 EVASIONS = {  # one representative per scan rule

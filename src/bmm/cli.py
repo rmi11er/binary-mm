@@ -11,7 +11,11 @@ def main(argv: list[str] | None = None) -> int:
         from bmm.spotcheck.cli import main as spotcheck_main
 
         return spotcheck_main(args[1:])
-    print("usage: bmm spotcheck {collect,report} ...", file=sys.stderr)
+    if args and args[0] == "scan":
+        from bmm.scan.cli import main as scan_main
+
+        return scan_main(args[1:])
+    print("usage: bmm {spotcheck {collect,report} | scan {rewards,report}} ...", file=sys.stderr)
     return 2
 
 
