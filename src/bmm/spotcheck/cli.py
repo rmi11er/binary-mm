@@ -91,16 +91,10 @@ async def _run(args: argparse.Namespace, specs: list[ProductSpec]) -> dict[str, 
         vc = _VirtualClock(min(firsts) if firsts else now_ns())
         src.set_clock(vc)
         return await collect(src, specs, qd, sink, vc, vc.sleep, args.gc_month)
-    qd = (
-        date.fromisoformat(args.question_date)
-        if args.question_date
-        else ns_to_ct(now_ns()).date()
-    )
+    qd = date.fromisoformat(args.question_date) if args.question_date else ns_to_ct(now_ns()).date()
     from bmm.spotcheck.ibsource import IBSource  # only after every safety check has passed
 
-    live = await IBSource.connect(
-        args.host, args.port, args.client_id, allow_hosts=args.allow_host
-    )
+    live = await IBSource.connect(args.host, args.port, args.client_id, allow_hosts=args.allow_host)
     try:
         return await collect(live, specs, qd, sink, now_ns, asyncio.sleep, args.gc_month)
     finally:
@@ -129,9 +123,23 @@ def _collect(args: argparse.Namespace) -> int:
     return 0 if any(v == "ok" for v in status.values()) else 2
 
 
+def _report(args: argparse.Namespace) -> int:
+    from bmm.spotcheck.report import write_report
+
+    try:
+        path = write_report(
+            Path(args.data), date.fromisoformat(args.d_from), date.fromisoformat(args.d_to),
+            Path(args.out), args.name,
+        )  # fmt: skip
+    except (ValueError, OSError) as e:
+        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print(path)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.cmd == "collect":
         return _collect(args)
-    print("report not implemented yet", file=sys.stderr)  # replaced in Task 13
-    return 2
+    return _report(args)

@@ -70,9 +70,25 @@ def test_live_flag_does_not_exist():
     assert e.value.code == 2
 
 
-def test_report_stub_exits_2(capsys):
-    assert main(["spotcheck", "report", "--from", "2026-10-05", "--to", "2026-10-05"]) == 2
-    assert "not implemented" in capsys.readouterr().err
+def test_report_without_data_exits_2(capsys, tmp_path):
+    assert (
+        main(
+            [
+                "spotcheck",
+                "report",
+                "--from",
+                "2026-10-05",
+                "--to",
+                "2026-10-05",
+                "--data",
+                str(tmp_path / "none"),
+                "--out",
+                str(tmp_path / "r"),
+            ]
+        )
+        == 2
+    )
+    assert "no ladder data" in capsys.readouterr().err
 
 
 def test_dispatcher_usage(capsys):

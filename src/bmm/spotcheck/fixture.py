@@ -188,15 +188,20 @@ def _build_product(key: str, qd: date, seed: int, idx: int) -> ProductData:
             if has_opts:
                 fb = fair_band(chain, k)
                 fair = fb.fair if fb is not None else _digital_numeric(F, k, T, p.vol0)
-                m = abs(math.log(k / F)) / (p.vol0 * math.sqrt(T))
+                # moneyness as the report buckets it: T to the *fix*, not to the option expiry
+                t_fix = (fix - ts) / YEAR_NS
+                m = abs(math.log(k / F)) / (p.vol0 * math.sqrt(t_fix)) if t_fix > 0 else 99.0
                 if p.mode == "rich" and 1.05 <= m < 1.95:
                     if k > F:
                         mid = math.ceil((fair + 0.04) * 100 - 1e-9) / 100
                     else:
                         mid = math.floor((fair - 0.04) * 100 + 1e-9) / 100
                 else:
-                    n = (rng.uniform(-p.noise, p.noise) if p.mode == "fair"
-                         else float(np.clip(rng.normal(0, p.noise), -2 * p.noise, 2 * p.noise)))
+                    n = (
+                        rng.uniform(-p.noise, p.noise)
+                        if p.mode == "fair"
+                        else float(np.clip(rng.normal(0, p.noise), -2 * p.noise, 2 * p.noise))
+                    )
                     mid = round(fair + n, 2)
                 yb = min(max(round(mid - p.venue_hs, 2), 0.01), 0.98)
                 ya = min(max(round(mid + p.venue_hs, 2), round(yb + 0.01, 2)), 0.99)
@@ -212,7 +217,13 @@ def _build_product(key: str, qd: date, seed: int, idx: int) -> ProductData:
                 if trades_done:
                     last, last_size = yb, 5.0
             rows.append([yb, ya, float(p.size), float(p.size), last, last_size, vol])
-        fut: list[float | None] = [round(F - p.tick / 2, 6), round(F + p.tick / 2, 6), 20.0, 20.0, F]
+        fut: list[float | None] = [
+            round(F - p.tick / 2, 6),
+            round(F + p.tick / 2, 6),
+            20.0,
+            20.0,
+            F,
+        ]
         snaps.append(Snap(ts, fut, rows, opts))
 
     month_name = "Dec 2026"
@@ -287,7 +298,9 @@ class FixtureSource:
         out: list[LadderQuote] = []
         for k, (yb, ya, bs, asz, last, lsz, vol) in zip(p.ladder_strikes, s.ladder, strict=True):
             assert yb is not None and ya is not None and bs is not None and asz is not None
-            out.append(LadderQuote(k, "C", raw_quote(yb, ya, int(bs), int(asz), last, int(lsz or 0), vol)))
+            out.append(
+                LadderQuote(k, "C", raw_quote(yb, ya, int(bs), int(asz), last, int(lsz or 0), vol))
+            )
             out.append(LadderQuote(k, "P", raw_quote(1.0 - ya, 1.0 - yb, int(asz), int(bs))))
         return out, [dict(d) for d in p.details]
 
