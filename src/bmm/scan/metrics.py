@@ -133,6 +133,7 @@ def eval_coll(expr: str | None, p: float) -> float:
 
 # --- proxied (backfilled / derived) quantities. Everything below feeds fields flagged `proxied`. ---
 STEP_NS = 5 * 60 * 10**9
+MIN_JUMP = 0.01  # one tick: floor on the adverse jump
 
 
 def resample_trades(trades: list[Trade], step_ns: int = STEP_NS) -> list[tuple[int, float]]:
@@ -146,7 +147,7 @@ def resample_trades(trades: list[Trade], step_ns: int = STEP_NS) -> list[tuple[i
         while i < len(ts) and ts[i].ts_ns // step_ns <= b:
             px = ts[i].price
             i += 1
-        out.append((b * step_ns, px))
+        out.append(((b + 1) * step_ns, px))  # stamped at bucket END: no look-ahead into the bucket
     return out
 
 
@@ -173,37 +174,48 @@ def mean_abs_move(
     return (sum(m) / len(m), len(m)) if m else (None, 0)
 
 
-def tail_move_1h(fine: list[tuple[int, float]], coarse: list[tuple[int, float]]) -> float | None:
-    """Empirical 99th percentile of |1h mid move|. `fine` is a ~5-minute series (1h lag);
-    `coarse` is a 3-hour series whose 3h moves are scaled by 1/sqrt(3). Takes the larger."""
+def tail_move_1h(
+    fine: list[tuple[int, float]],
+    coarse: list[tuple[int, float]],
+    fine_obs: int | None = None,
+    coarse_obs: int | None = None,
+) -> float | None:
+    """Empirical 99th percentile of |1h mid move|; None when there are too few REAL observations.
+    `fine` is a ~5-minute series (1h lag), `coarse` a 3-hour series (3h moves, deliberately NOT
+    scaled down: jumps do not diffuse). Takes the larger. `*_obs` = real observations behind a
+    forward-filled series (e.g. trade count); a filled bucket is not an observation."""
     import numpy as np
 
     h = 3600 * 10**9
     cands: list[float] = []
     f = _moves(fine, h, 10 * 60 * 10**9)
-    if len(f) >= 20:
+    if len(f) >= 20 and (len(fine) if fine_obs is None else fine_obs) >= 100:
         cands.append(float(np.percentile(f, 99)))
     c = _moves(coarse, 3 * h, 90 * 60 * 10**9)
-    if len(c) >= 10:
-        cands.append(float(np.percentile(c, 99)) / 3**0.5)
+    if len(c) >= 10 and (len(coarse) if coarse_obs is None else coarse_obs) >= 10:
+        cands.append(float(np.percentile(c, 99)))
     return max(cands) if cands else None
 
 
 def calibrate_lambda(rows: list[tuple[float, float, float]]) -> float | None:
     """lambda = sum(n|markout|) / sum(n * mean|30m move|) over (n, markout, move) rows from venues
     with a tape, clamped to [0.05, 1]. Converts a tape-less venue's 30m mid movement to a markout."""
-    num = sum(n * abs(m) for n, m, _ in rows)
+    num = sum(n * max(0.0, -m) for n, m, _ in rows)  # adverse part only: spread capture is not cost
     den = sum(n * v for n, _, v in rows)
-    return None if den <= 0 else min(1.0, max(0.05, num / den))
+    if den <= 0 or num <= 0:
+        return None
+    raw = num / den
+    return (
+        raw if 0.05 <= raw <= 1.0 else None
+    )  # outside the plausible band: uncalibrated, not clamped
 
 
 def adverse_jump(side: Side, price: float, jump_class: str, p99: float | None) -> float:
     """Adverse price jump per contract: a bid loses if the price gaps toward 0, an ask toward 1.
     jump_class high -> the full distance; otherwise the empirical 1h tail capped at that distance."""
     dist = min(1.0, max(0.0, price if side == "bid" else 1.0 - price))
-    if jump_class == "high" or p99 is None:
-        return dist
-    return min(p99, dist)
+    jump = dist if jump_class == "high" or p99 is None else min(p99, dist)
+    return max(MIN_JUMP, jump)  # never 0: a zero would switch the stress cap off
 
 
 def fills_from_shares(

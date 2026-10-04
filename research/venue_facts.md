@@ -142,3 +142,4 @@ Task 1 of docs/plans/rewards-scanner.md. All accessed 2026-10-04. Fixtures: `tes
 - kalshi: Reference Price definition (help page vs CFTC filing); tick unit in the discount exponent; maker fee coefficient and which series charge it (fee PDF not read); amount reserved for a resting order; settlement source structured field.
 - gemini: spread-weight formula, size-cap and min-size mechanics, pool scope (per event vs shared), day boundary, whether `type` in trades is the taker side, collateral rule for bid and ask, fee and rebate net treatment.
 - forecastex: renewal status.
+- [?] pm_us `sharesTraded`: whether it counts both sides of a trade or each contract once is unconfirmed; the scanner halves it per side and flags fills as proxied (added 2026-10-04).
