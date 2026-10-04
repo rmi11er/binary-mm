@@ -29,6 +29,9 @@ class ProductSpec:
     fix_ct: tuple[int, int]
     payout_scale: float
     ref_rule: RefRule
+    # Vanilla option classes to use. Empty = any class except `trading_class` and EC*; confirm
+    # the real class names on the first paper connect.
+    opt_trading_classes: tuple[str, ...] = ()
 
 
 PRODUCTS: dict[str, ProductSpec] = {
@@ -55,6 +58,20 @@ PRODUCTS: dict[str, ProductSpec] = {
 }  # fmt: skip
 
 
+def option_class_ok(spec: ProductSpec, trading_class: str) -> bool:
+    """May this option trading class be used as the vanilla chain for `spec`?
+
+    Never the venue's own event-contract class (`spec.trading_class`) nor any EC* class: those
+    expire exactly at the fix, share the reference future, and price at the binary itself.
+    """
+    tc = trading_class.strip()
+    if spec.trading_class and tc.upper() == spec.trading_class.upper():
+        return False
+    if tc.upper().startswith("EC"):
+        return False
+    return not spec.opt_trading_classes or tc in spec.opt_trading_classes
+
+
 def load_products(path: Path | None) -> dict[str, ProductSpec]:
     """Defaults, with per-product field overrides from `[products.<key>]` TOML tables."""
     out = dict(PRODUCTS)
@@ -72,6 +89,8 @@ def load_products(path: Path | None) -> dict[str, ProductSpec]:
         if "fix_ct" in over:
             h, m = over["fix_ct"]
             over["fix_ct"] = (int(h), int(m))
+        if "opt_trading_classes" in over:
+            over["opt_trading_classes"] = tuple(str(c) for c in over["opt_trading_classes"])
         out[key] = replace(out[key], **over)
     return out
 
@@ -82,9 +101,11 @@ def lead_month(question_date: date, final_settlement_dates: list[date]) -> date:
     The lead month references the second month on the day it goes through final settlement.
     """
     ds = sorted(final_settlement_dates)
-    cands = [d for d in ds if d > question_date] if question_date in ds else [
-        d for d in ds if d >= question_date
-    ]
+    cands = (
+        [d for d in ds if d > question_date]
+        if question_date in ds
+        else [d for d in ds if d >= question_date]
+    )
     if not cands:
         raise ValueError(f"no final settlement date on/after {question_date}")
     return cands[0]
@@ -107,11 +128,16 @@ ASSUMPTIONS: dict[str, str] = {
 }
 
 
-def parse_gc_month(text: str, question_date: date) -> str | None:
+def parse_gc_month(
+    text: str,
+    question_date: date,
+    anchor: re.Pattern[str] | None = _GOLD_FUT,
+    strict_year: bool = False,
+) -> str | None:
     """Contract month (YYYYMM) of the gold future named in `text`, or None if absent/ambiguous.
 
     Only whole month names or 3-letter abbreviations followed by a 2- or 4-digit year are
-    accepted. A 2-digit number followed by ", YYYY" is a day of month, not a year. Years outside
+    accepted ("strict_year": 2-digit years only with a "-" or apostrophe separator). A 2-digit number followed by ", YYYY" is a day of month, not a year. Years outside
     [question year - 1, question year + 3] are rejected. If several distinct months remain,
     prefer the one adjacent to "gold futures"; otherwise return None rather than guess.
     """
@@ -121,6 +147,8 @@ def parse_gc_month(text: str, question_date: date) -> str | None:
         digits = m.group(2)
         if len(digits) == 2 and _DAY_TAIL.match(text, m.end()):
             continue
+        if strict_year and len(digits) == 2 and not re.search(r"[\-']", m.group(0)):
+            continue  # "Oct 26" is more likely a day than a year; require "Oct-26" / "Oct'26"
         yr = int(digits) + (2000 if len(digits) == 2 else 0)
         if not (qy - 1 <= yr <= qy + 3):
             continue
@@ -129,7 +157,7 @@ def parse_gc_month(text: str, question_date: date) -> str | None:
     distinct = {f[0] for f in found}
     if len(distinct) <= 1:
         return next(iter(distinct), None)
-    anchors = [g.span() for g in _GOLD_FUT.finditer(text)]
+    anchors = [g.span() for g in anchor.finditer(text)] if anchor else []
     near = {
         v
         for v, a, b in found

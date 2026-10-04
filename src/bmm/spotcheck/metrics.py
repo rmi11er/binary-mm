@@ -9,6 +9,9 @@ Conventions
   Post-fix rows are excluded from every headline statistic (they are not a mispricing signal)
   and appear only in the post-fix section and in ttf-bucket breakdowns.
 - Crossed ladder rows are kept in the frame but excluded from gap, taker and persistence stats.
+- Snapshots flagged `df_flag` (the future moved enough during the fetch to shift the digital by
+  more than 1c) are kept in the frame and excluded from the same stats. F is the mean of the
+  before/after future quotes (options.und_px).
 """
 
 from __future__ import annotations
@@ -41,7 +44,7 @@ EF_SCHEMA: dict[str, Any] = {
     "arb_sell_edge": pl.Float64, "bid_size": pl.Int64, "ask_size": pl.Int64,
     "F": pl.Float64, "sigma": pl.Float64, "T": pl.Float64, "m_bucket": pl.String,
     "ttf_bucket": pl.String, "expiry_mismatch": pl.Boolean, "crossed": pl.Boolean,
-    "stale_chain": pl.Boolean, "opt_snapshot_id": pl.String, "opt_ts_ns": pl.Int64,
+    "stale_chain": pl.Boolean, "df_flag": pl.Boolean, "opt_snapshot_id": pl.String, "opt_ts_ns": pl.Int64,
     "opt_expiry_ts_ns": pl.Int64,
 }  # fmt: skip
 
@@ -126,6 +129,11 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
     snaps = lad.group_by("product", "snapshot_id", "fix_ts_ns").agg(pl.col("ts_ns").first())
     fix_of = {r["snapshot_id"]: r["fix_ts_ns"] for r in snaps.iter_rows(named=True)}
     chains = _select_chains(tables["options"], fix_of)
+    fut = tables["futures"]
+    flagged = (
+        {r["snapshot_id"] for r in fut.filter(pl.col("df_flag")).iter_rows(named=True)}
+        if "df_flag" in fut.columns else set()
+    )  # fmt: skip
     by_snap = {k[0]: g for k, g in lad.partition_by("snapshot_id", as_dict=True).items()}
     out: list[dict[str, Any]] = []
     last_pre: dict[tuple[str, int], tuple[_Chain, float]] = {}
@@ -164,7 +172,7 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
                 "ask_size": e.ask_size, "F": ref_ch.F, "sigma": ref_ch.sigma, "T": ref_T,
                 "m_bucket": moneyness_bucket(e.strike, ref_ch.F, ref_ch.sigma, ref_T),
                 "ttf_bucket": ttf_bucket(ts, fix), "expiry_mismatch": ch.mismatch,
-                "crossed": bool(lr["crossed"]), "stale_chain": stale,
+                "crossed": bool(lr["crossed"]), "stale_chain": stale, "df_flag": sid in flagged,
                 "opt_snapshot_id": ch.snapshot_id, "opt_ts_ns": ch.ts_ns,
                 "opt_expiry_ts_ns": ch.expiry_ts_ns,
             })  # fmt: skip
@@ -180,7 +188,7 @@ def _f(x: Any) -> float:
 
 def _headline(ef: pl.DataFrame) -> pl.DataFrame:
     """Pre-fix, non-crossed rows (the population every headline statistic uses)."""
-    return ef.filter((pl.col("ttf_bucket") != "post-fix") & ~pl.col("crossed"))
+    return ef.filter((pl.col("ttf_bucket") != "post-fix") & ~pl.col("crossed") & ~pl.col("df_flag"))
 
 
 def _order(df: pl.DataFrame) -> pl.DataFrame:
@@ -193,7 +201,7 @@ def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataF
 
     Crossed rows are always excluded. Post-fix rows are excluded unless "ttf_bucket" is in `by`.
     """
-    d = ef.filter(~pl.col("crossed") & pl.col("mid_gap").is_not_null())
+    d = ef.filter(~pl.col("crossed") & ~pl.col("df_flag") & pl.col("mid_gap").is_not_null())
     if "ttf_bucket" not in by:
         d = d.filter(pl.col("ttf_bucket") != "post-fix")
     d = d.with_columns(g=pl.col("mid_gap").abs())
@@ -264,7 +272,7 @@ def persistence(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
     or |gap| <= thr breaks the run. A run is attributed to the moneyness bucket of its first
     snapshot. Only pre-fix rows are used.
     """
-    d = ef.filter(ef["ttf_bucket"] != "post-fix")
+    d = ef.filter(pl.col("ttf_bucket") != "post-fix")
     runs: dict[tuple[str, str], list[int]] = defaultdict(list)
     for pkey, g in d.group_by("product"):
         pname = str(pkey[0])
@@ -280,6 +288,7 @@ def persistence(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
                 o = ordinal[r["ts_ns"]]
                 hit = (
                     (not r["crossed"])
+                    and (not r["df_flag"])
                     and r["mid_gap"] is not None
                     and abs(r["mid_gap"]) > thr + EPS
                 )

@@ -123,3 +123,47 @@ def test_bracket_sides_limited_to_two_days():
     near = ox(FIX + 3_600_000_000_000)
     m = match_expiry(FIX, 111, [far, near])
     assert m and [r for _, r in m.chosen] == ["above"]
+
+
+# --- quant-review C1: option class filter -------------------------------------------------------
+def test_option_class_ok_always_excludes_event_contract_classes():
+    from dataclasses import replace
+
+    from bmm.spotcheck.contracts import option_class_ok
+
+    cme = PRODUCTS["cme-gold"]
+    assert not option_class_ok(cme, "ECGC") and not option_class_ok(cme, "ecgc")
+    assert not option_class_ok(cme, "ECXX")
+    assert option_class_ok(cme, "OG")
+    assert not option_class_ok(PRODUCTS["forecastex-spx"], "EC1")
+    assert option_class_ok(PRODUCTS["forecastex-spx"], "ES")
+    only = replace(cme, opt_trading_classes=("OG",))
+    assert option_class_ok(only, "OG") and not option_class_ok(only, "G2")
+    # an allowlist cannot re-admit an excluded class
+    assert not option_class_ok(replace(cme, opt_trading_classes=("ECGC",)), "ECGC")
+
+
+def test_opt_trading_classes_from_toml(tmp_path):
+    f = tmp_path / "p.toml"
+    f.write_text('[products.cme-gold]\nopt_trading_classes = ["OG", "G2"]\n')
+    assert load_products(f)["cme-gold"].opt_trading_classes == ("OG", "G2")
+    assert PRODUCTS["cme-gold"].opt_trading_classes == ()
+
+
+def test_match_expiry_never_picks_event_class_after_filtering():
+    fix = ct_to_ns(QD, 12, 30)
+    decoy = OptExpiry(fix, 7, "ECGC", "20261005")
+    real = OptExpiry(fix + 86_400 * 10**9, 7, "OG", "20261006")
+    from bmm.spotcheck.contracts import option_class_ok
+
+    kept = [e for e in (decoy, real) if option_class_ok(PRODUCTS["cme-gold"], e.trading_class)]
+    m = match_expiry(fix, 7, kept)
+    assert m and m.mismatch and m.chosen[0][0].trading_class == "OG"
+
+
+def test_parse_month_without_anchor_and_strict_year():
+    from bmm.spotcheck.contracts import parse_gc_month as p
+
+    assert p("ES Dec-26 above 6500", QD, anchor=None, strict_year=True) == "202612"
+    assert p("above 6500 on Oct 26", QD, anchor=None, strict_year=True) is None
+    assert p("S&P Dec 2026 close", QD, anchor=None, strict_year=True) == "202612"

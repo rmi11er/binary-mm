@@ -39,8 +39,13 @@ class FakeIB:
         object.__setattr__(self, "ticker_batches", [])
         object.__setattr__(self, "accounts", ["DU1234567"])
         object.__setattr__(self, "details_by_type", {})
-        object.__setattr__(self, "ticker_fn", lambda c: NS(bid=0.4, ask=0.5, bidSize=10, askSize=10,
-                                                           last=NAN, lastSize=NAN, volume=NAN))
+        object.__setattr__(
+            self,
+            "ticker_fn",
+            lambda c: NS(
+                bid=0.4, ask=0.5, bidSize=10, askSize=10, last=NAN, lastSize=NAN, volume=NAN
+            ),
+        )
         object.__setattr__(self, "client", FakeClient())
 
     def __getattribute__(self, name):
@@ -89,10 +94,24 @@ def _reset():
 
 
 def cd(strike, right, long_name="", under=0, sec="OPT", **kw):
-    c = Contract(secType=sec, conId=int(strike) * 10 + (1 if right == "C" else 2), strike=strike,
-                 right=right, localSymbol=f"L{strike}{right}", multiplier="1", **kw)
-    return ContractDetails(contract=c, minTick=0.01, priceMagnifier=1, longName=long_name,
-                           lastTradeTime="15:00:00", timeZoneId="US/Central", underConId=under)
+    c = Contract(
+        secType=sec,
+        conId=int(strike) * 10 + (1 if right == "C" else 2),
+        strike=strike,
+        right=right,
+        localSymbol=f"L{strike}{right}",
+        multiplier="1",
+        **kw,
+    )
+    return ContractDetails(
+        contract=c,
+        minTick=0.01,
+        priceMagnifier=1,
+        longName=long_name,
+        lastTradeTime="15:00:00",
+        timeZoneId="US/Central",
+        underConId=under,
+    )
 
 
 def src(ib, max_lines=90):
@@ -184,8 +203,16 @@ def test_no_order_names_touched_on_normal_flow():
 
 
 # --- order stubs -------------------------------------------------------------------------------
-NAMES = ["placeOrder", "cancelOrder", "reqGlobalCancel", "whatIfOrder", "whatIfOrderAsync",
-         "bracketOrder", "oneCancelsAll", "exerciseOptions"]
+NAMES = [
+    "placeOrder",
+    "cancelOrder",
+    "reqGlobalCancel",
+    "whatIfOrder",
+    "whatIfOrderAsync",
+    "bracketOrder",
+    "oneCancelsAll",
+    "exerciseOptions",
+]
 
 
 def test_order_methods_raise_on_fake():
@@ -228,8 +255,19 @@ def test_ladder_six_quotes_and_details_log():
     quotes, log = run(src(ib).ladder(PRODUCTS["forecastex-spx"], QD))
     assert len(quotes) == 6 and sorted({q.right for q in quotes}) == ["C", "P"]
     assert quotes[0].quote.bid == 0.4 and quotes[0].quote.ask_size == 10
-    assert set(log[0]) == {"conId", "localSymbol", "right", "strike", "multiplier", "minTick",
-                           "priceMagnifier", "longName", "lastTradeTime", "timeZoneId", "underConId"}
+    assert set(log[0]) == {
+        "conId",
+        "localSymbol",
+        "right",
+        "strike",
+        "multiplier",
+        "minTick",
+        "priceMagnifier",
+        "longName",
+        "lastTradeTime",
+        "timeZoneId",
+        "underConId",
+    }
     assert ("details", "OPT", "FORECASTX", "FES") in ib.calls
 
 
@@ -241,8 +279,11 @@ def test_ladder_batches_tickers():
 
 def test_ladder_all_nan_raises_paper_error():
     ib = ladder_ib()
-    object.__setattr__(ib, "ticker_fn", lambda c: NS(bid=NAN, ask=-1.0, bidSize=NAN, askSize=0,
-                                                     last=NAN, lastSize=NAN, volume=NAN))
+    object.__setattr__(
+        ib,
+        "ticker_fn",
+        lambda c: NS(bid=NAN, ask=-1.0, bidSize=NAN, askSize=0, last=NAN, lastSize=NAN, volume=NAN),
+    )
     with pytest.raises(SourceError, match="paper"):
         run(src(ib).ladder(PRODUCTS["forecastex-spx"], QD))
 
@@ -297,8 +338,12 @@ def test_expiries_strikes_and_calls(monkeypatch):
 
     monkeypatch.setattr("bmm.spotcheck.ibsource.now_ns", lambda: ct_to_ns(QD, 9, 0))
     ib = FakeIB()
-    chain = NS(exchange="CME", tradingClass="ES", expirations={"20261005", "20261201"},
-               strikes={6500.0, 6510.0, 6520.0})
+    chain = NS(
+        exchange="CME",
+        tradingClass="ES",
+        expirations={"20261005", "20261201"},
+        strikes={6500.0, 6510.0, 6520.0},
+    )
 
     async def secdef(*a):
         return [chain]
@@ -331,3 +376,102 @@ def test_reference_future_touches_only_allowed_names(monkeypatch):
         pass  # the probe is about which ib names are touched, not about resolution
     assert not [n for n in FakeIB.log if re.search("order", n, re.IGNORECASE)], FakeIB.log
     assert set(FakeIB.log) <= ALLOWED_IB_NAMES, set(FakeIB.log) - ALLOWED_IB_NAMES
+
+
+# --- quant-review fixes: month cross-checks, live quotes, horizon --------------------------------
+def test_named_gc_no_matching_contract_month_raises():
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [fut_cd("202701")]
+    spec = PRODUCTS["forecastex-gold"]
+    with pytest.raises(SourceError, match="contractMonth"):
+        run(src(ib).reference_future(spec, QD, [{"longName": "Gold Dec 2026"}], None))
+
+
+def test_named_gc_months_across_ladder_must_agree():
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [fut_cd("202612")]
+    spec = PRODUCTS["forecastex-gold"]
+    details = [{"longName": "Gold futures Dec 2026"}, {"longName": "Gold futures Feb 2027"}]
+    with pytest.raises(SourceError, match="several"):
+        run(src(ib).reference_future(spec, QD, details, None))
+
+
+def test_named_gc_explicit_month_must_not_contradict_parsed():
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [fut_cd("202612")]
+    spec = PRODUCTS["forecastex-gold"]
+    with pytest.raises(SourceError, match="disagrees"):
+        run(src(ib).reference_future(spec, QD, [{"longName": "Gold Dec 2026"}], "202702"))
+    f = run(src(ib).reference_future(spec, QD, [{"longName": "Gold Dec 2026"}], "202612"))
+    assert f.contract_month == "202612"
+
+
+def test_lead_quarterly_cross_checks_month_named_in_question():
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [fut_cd("202612", "20261218", 1), fut_cd("202703", "20270319", 2)]
+    spec = PRODUCTS["forecastex-spx"]
+    ok = [{"longName": "FES ES Dec-26 above 6500"}]
+    assert run(src(ib).reference_future(spec, QD, ok, None)).con_id == 1
+    with pytest.raises(SourceError, match="lead-month"):
+        run(src(ib).reference_future(spec, QD, [{"longName": "FES ES Mar-27 above 6500"}], None))
+    # "Oct 26" is a day of month, not a year: no month named, no failure
+    assert run(src(ib).reference_future(spec, QD, [{"longName": "above 6500 on Oct 26"}], None))
+
+
+def test_future_quote_ignores_size_zero_prices():
+    ib = FakeIB()
+    ib.details_by_type["FUT"] = [fut_cd("202612", "20261218", 1)]
+    object.__setattr__(ib, "ticker_fn", lambda c: NS(bid=6500.0, ask=6501.0, bidSize=0, askSize=5,
+                                                     last=6500.5, lastSize=1, volume=NAN))
+    f = run(src(ib).reference_future(PRODUCTS["forecastex-spx"], QD, [], None))
+    assert f.quote.bid is None and f.quote.ask == 6501.0 and f.quote.last == 6500.5
+
+
+def test_option_quotes_drop_stale_and_crossed_and_carry_sizes():
+    ib = FakeIB()
+    quotes = {
+        1: NS(bid=1.0, ask=1.2, bidSize=7, askSize=9, last=NAN, lastSize=NAN, volume=NAN),
+        2: NS(bid=1.0, ask=1.2, bidSize=0, askSize=9, last=NAN, lastSize=NAN, volume=NAN),
+        3: NS(bid=2.0, ask=1.0, bidSize=3, askSize=3, last=NAN, lastSize=NAN, volume=NAN),
+    }
+    n = iter([1, 2, 3])
+    object.__setattr__(ib, "ticker_fn", lambda c: quotes[next(n)])
+    exp = OptExpiry(1, 1, "ES", "20261005")
+    out = run(src(ib).calls(PRODUCTS["forecastex-spx"], exp, [6500.0, 6510.0, 6520.0]))
+    assert [(q.strike, q.call_bid, q.call_ask) for q in out] == [(6500.0, 1.0, 1.2),
+                                                                  (6510.0, 0.0, 1.2)]
+    assert (out[0].call_bid_size, out[0].call_ask_size) == (7, 9)
+
+
+def test_expiry_horizon_is_built_around_the_question_date():
+    ib = FakeIB()
+    chain = NS(exchange="CME", tradingClass="ES", expirations={"20261005"}, strikes={6500.0})
+
+    async def secdef(*a):
+        return [chain]
+
+    object.__setattr__(ib, "reqSecDefOptParamsAsync", secdef)
+    ib.details_by_type["FOP"] = [cd(6500.0, "C", under=1, sec="FOP")]
+    spec = PRODUCTS["forecastex-spx"]
+    fut = FutQuote(1, "ESZ6", "202612", raw_quote(None, None, 0, 0))
+    # wall clock is today (2026-10-04 in this sandbox or later): the question date decides
+    assert run(src(ib).option_expiries(spec, fut, QD))
+    assert not run(src(ib).option_expiries(spec, fut, date(2026, 9, 1)))
+
+
+def test_event_contract_and_ec_classes_never_returned():
+    ib = FakeIB()
+    chains = [
+        NS(exchange="COMEX", tradingClass=tc, expirations={"20261005"}, strikes={4000.0})
+        for tc in ("OG", "ECGC", "ECXX")
+    ]
+
+    async def secdef(*a):
+        return chains
+
+    object.__setattr__(ib, "reqSecDefOptParamsAsync", secdef)
+    ib.details_by_type["FOP"] = [cd(4000.0, "C", under=1, sec="FOP")]
+    spec = PRODUCTS["cme-gold"]
+    fut = FutQuote(1, "GCZ6", "202612", raw_quote(None, None, 0, 0))
+    got = run(src(ib).option_expiries(spec, fut, QD))
+    assert {e.trading_class for e in got} == {"OG"}

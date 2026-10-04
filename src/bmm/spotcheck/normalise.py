@@ -81,6 +81,15 @@ def _live(px: float | None, size: int) -> float | None:
     return px if px is not None and size > 0 else None
 
 
+def live_quote(q: RawQuote) -> RawQuote:
+    """Drop bid/ask prices with no displayed size (stale) and any crossed bid/ask pair."""
+    bid, ask = _live(q.bid, q.bid_size), _live(q.ask, q.ask_size)
+    if bid is not None and ask is not None and bid > ask:
+        bid = ask = None
+    return RawQuote(bid, ask, q.bid_size if bid is not None else 0,
+                    q.ask_size if ask is not None else 0, q.last, q.last_size, q.volume)  # fmt: skip
+
+
 def forecastex_row(strike: float, yes: RawQuote, no: RawQuote) -> NormRow:
     for px in (yes.bid, yes.ask, no.bid, no.ask):
         if px is not None and px > 1.0 + _EPS:

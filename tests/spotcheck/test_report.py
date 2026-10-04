@@ -82,3 +82,10 @@ def test_mismatch_section_flags_cme_gold(report):
     sec = _sections(report[0].read_text())["cme-gold"]
     s7 = sec.split("### 7. Expiry mismatch")[1].split("### 8.")[0]
     assert "100%" in s7
+
+
+def test_section_2_states_excluded_df_flag_snapshots(report):
+    sec = _sections(report[0].read_text())["forecastex-spx"]
+    s2 = sec.split("### 2. Mid gap vs fair")[1].split("### 3.")[0]
+    assert "0 of 66 pre-fix snapshots excluded" in s2
+    assert "df_flag" in s2

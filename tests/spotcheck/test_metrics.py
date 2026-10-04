@@ -221,6 +221,7 @@ def _ef(rows):
             "expiry_mismatch": False,
             "crossed": False,
             "stale_chain": False,
+            "df_flag": False,
             "opt_snapshot_id": "o",
             "opt_ts_ns": 0,
             "opt_expiry_ts_ns": 0,
@@ -430,3 +431,26 @@ def test_mismatch_share_and_bias():
     assert m["median_abs_gap_matched"] == pytest.approx(0.02, abs=1e-12)
     assert m["median_abs_gap_mismatched"] == pytest.approx(0.05, abs=1e-12)
     assert m["bias_abs"] == pytest.approx(0.03, abs=1e-12)
+
+
+def test_df_flag_snapshots_excluded_from_gap_and_persistence():
+    ef = _ef([{"gap": 4, "i": 0}, {"gap": 4, "i": 1, "df_flag": True}, {"gap": 4, "i": 2}])
+    assert gap_stats(ef)["n"].sum() == 2
+    assert persistence(ef)["max_run"][0] == 1  # the flagged snapshot breaks the run
+
+
+def test_edge_frame_carries_df_flag_from_futures():
+    chain = _chain()
+    ts = FIX - 10 * MIN
+    lad = [
+        _ladder_row("s0", ts, 6560.0, 0.12, 0.14),
+        _ladder_row("s1", ts + MIN, 6560.0, 0.12, 0.14),
+    ]
+    opt = _opt_rows("s0", ts, chain) + _opt_rows("s1", ts + MIN, chain)
+    fut = []
+    for sid, flag in (("s0", True), ("s1", False)):
+        r = dict.fromkeys(FUTURES_SCHEMA)
+        r.update(snapshot_id=sid, df_flag=flag)
+        fut.append(r)
+    ef = edge_frame(_tables(lad, opt, fut), 0.01).sort("ts_ns")
+    assert ef["df_flag"].to_list() == [True, False]

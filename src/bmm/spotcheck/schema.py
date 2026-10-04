@@ -22,6 +22,8 @@ LADDER_SCHEMA: dict[str, Any] = {
     "bid_size": pl.Int64,
     "ask_size": pl.Int64,
     "crossed": pl.Boolean,
+    "post_fix": pl.Boolean,  # ts_ns >= fix_ts_ns
+    "ladder_ts_ns": pl.Int64,  # when the ladder fetch completed
     "raw_yes_bid": pl.Float64,
     "raw_yes_bid_size": pl.Int64,
     "raw_yes_ask": pl.Float64,
@@ -48,6 +50,10 @@ FUTURES_SCHEMA: dict[str, Any] = {
     "bid_size": pl.Int64,
     "ask_size": pl.Int64,
     "last": pl.Float64,
+    "fut_ts_ns": pl.Int64,  # when the first future quote was taken
+    "und_px_before": pl.Float64,  # future mid before the option fetch
+    "und_px_after": pl.Float64,  # future mid re-quoted after the option fetch
+    "df_flag": pl.Boolean,  # |dF| x digital delta at the ATM ladder strike > 1c
 }
 
 OPTIONS_SCHEMA: dict[str, Any] = {
@@ -56,12 +62,16 @@ OPTIONS_SCHEMA: dict[str, Any] = {
     "product": pl.String,
     "underlying_con_id": pl.Int64,
     "expiry_ts_ns": pl.Int64,
+    "trading_class": pl.String,
     "expiry_role": pl.String,  # "match" | "below" | "above"
     "expiry_mismatch": pl.Boolean,
     "strike": pl.Float64,
     "call_bid": pl.Float64,
     "call_ask": pl.Float64,
-    "und_px": pl.Float64,
+    "call_bid_size": pl.Int64,
+    "call_ask_size": pl.Int64,
+    "opt_ts_ns": pl.Int64,  # when this expiry's option fetch completed
+    "und_px": pl.Float64,  # mean of und_px_before and und_px_after
     "atm_sigma": pl.Float64,
 }
 

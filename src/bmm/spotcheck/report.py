@@ -188,6 +188,16 @@ def write_report(
     present = set(tables["ladder"]["product"].unique().to_list())
     products = [k for k in PRODUCTS if k in present] + sorted(present - set(PRODUCTS))
 
+    pre = efv.filter(pl.col("ttf_bucket") != "post-fix")
+
+    def flagged(p: str) -> tuple[int, int]:
+        d = (
+            pre.filter(pl.col("product") == p)
+            .group_by("snapshot_id")
+            .agg(f=pl.col("df_flag").first())
+        )
+        return int(d["f"].sum()), d.height
+
     gap_all, gap_m = metrics.gap_stats(efv), metrics.gap_stats(efm)
     gap_ttf = metrics.gap_stats(efv, by=("ttf_bucket",))
     taker = metrics.taker_stats(efv, FEES)
@@ -230,6 +240,10 @@ def write_report(
         out += [f"## {p}", "", "### 1. Ladder quality", "", _section_ladder(lq, p)]
         out += [
             "### 2. Mid gap vs fair", "",
+            f"{flagged(p)[0]} of {flagged(p)[1]} pre-fix snapshots excluded from the statistics "
+            "below and from sections 3, 5 and the verdict: `df_flag` (the future moved during the "
+            "fetch by enough to shift the digital by more than 1c). F is the mean of the "
+            "before/after future quotes.", "",
             "By moneyness bucket (all pre-fix, non-crossed observations, expiry-mismatched "
             "chains included):", "",
             _md(_order_buckets(pf(gap_all), "m_bucket", metrics.MONEYNESS_BUCKETS), gfmt, gren),

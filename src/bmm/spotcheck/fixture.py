@@ -6,7 +6,8 @@ Designed so the report yields known verdicts on question date 2026-10-05:
   forecastex-gold  INVESTIGATE   same +-4c gaps, displayed size 3 (tiny)
   cme-gold         INVESTIGATE   same gaps, size 40, but the only option expiry is fix + 24h
                                  (every snapshot is expiry-mismatched)
-Snapshot grids follow the collector's cadence (5 min to fix-30m, then 1 min to fix+30m). The
+The cme-gold session also lists a decoy ECGC (event-contract class) expiry exactly at its fix, which
+the collector must never choose. Snapshot grids follow the collector's cadence (5 min to fix-30m, then 1 min to fix+30m). The
 gold products start at fix-60m (11:30 CT) and the equity products at fix-210m (also 11:30 CT), so
 a single collector run started at 11:30 CT has data for every product at every slot.
 Gaps are measured against the same `analyze.fair_band` the report uses, so the designed gap is
@@ -36,7 +37,7 @@ from bmm.clock import ct_to_ns, ns_to_ct
 from bmm.spotcheck.analyze import OptQuote, fair_band
 from bmm.spotcheck.contracts import PRODUCTS, OptExpiry, ProductSpec
 from bmm.spotcheck.normalise import raw_quote
-from bmm.spotcheck.source import FutQuote, LadderQuote, SourceError
+from bmm.spotcheck.source import FutQuote, LadderQuote, SizedOptQuote, SourceError
 from bmm.spotcheck.vol import black76_call
 
 MIN_NS = 60 * 1_000_000_000
@@ -75,7 +76,7 @@ _P: dict[str, _Params] = {
                               0.02, "fair", 0.01, 0, -210),
     "forecastex-gold": _Params(1003, 4000.0, 0.18, 1.5, 0.1, 1.0, 30, 10.0, 150.0, 0.1, "OG", 3,
                                0.01, "rich", 0.002, 0),
-    "cme-gold": _Params(1004, 4000.0, 0.18, 1.5, 0.1, 5.0, 20, 10.0, 200.0, 0.1, "ECGC", 40,
+    "cme-gold": _Params(1004, 4000.0, 0.18, 1.5, 0.1, 5.0, 20, 10.0, 200.0, 0.1, "OG", 40,
                         0.01, "rich", 0.002, 24 * 60),
 }  # fmt: skip
 
@@ -153,6 +154,9 @@ def _build_product(key: str, qd: date, seed: int, idx: int) -> ProductData:
     expiries = [expiry]
     if key == "forecastex-spx":  # decoy chain on another future with the same expiry
         expiries.append(OptExpiry(expiry_ts, 9999, "ES", exp_date))
+    if key == "cme-gold":  # decoy: the event contract's own ECGC expiry, exactly at the fix
+        fix_date = ns_to_ct(fix).date().strftime("%Y%m%d")
+        expiries.append(OptExpiry(fix, p.con_id, "ECGC", fix_date))
     ekey = _key(expiry)
 
     snaps: list[Snap] = []
@@ -318,10 +322,11 @@ class FixtureSource:
             raw_quote(b, a, int(bs or 0), int(asz or 0), last),
         )  # fmt: skip
 
-    async def option_expiries(self, spec: ProductSpec, fut: FutQuote) -> list[OptExpiry]:
+    async def option_expiries(
+        self, spec: ProductSpec, fut: FutQuote, question_date: date | None = None
+    ) -> list[OptExpiry]:
         p, _ = self._snap(spec)
-        now = self._clock()
-        return [OptExpiry(**e) for e in p.expiries if e["expiry_ts_ns"] > now]
+        return [OptExpiry(**e) for e in p.expiries]  # passed expiries too, like the real secdef
 
     async def listed_strikes(self, spec: ProductSpec, expiry: OptExpiry) -> list[float]:
         return list(self._p(spec).opt_strikes)
@@ -332,9 +337,11 @@ class FixtureSource:
         p, s = self._snap(spec)
         data = s.opts.get(_key(expiry))
         if data is None:
+            if expiry.expiry_ts_ns <= self._clock():
+                return []  # expired: nothing qualifies, like IB
             raise SourceError(f"fixture: no option data for {_key(expiry)}")
         by_k = dict(zip(p.opt_strikes, zip(data[0], data[1], strict=True), strict=True))
-        return [OptQuote(k, *by_k[k]) for k in strikes if k in by_k]
+        return [SizedOptQuote(k, *by_k[k], 10, 10) for k in strikes if k in by_k]
 
     async def close(self) -> None:
         return None

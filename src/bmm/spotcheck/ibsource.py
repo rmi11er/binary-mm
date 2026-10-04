@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from datetime import date, timedelta
 from typing import Any
 
+import structlog
 from ib_async import IB, Contract, Future, FuturesOption, StartupFetch
 
 from bmm.clock import now_ns, ns_to_ct
@@ -24,9 +25,10 @@ from bmm.spotcheck.contracts import (
     ProductSpec,
     expiry_ts_ns,
     lead_month,
+    option_class_ok,
     parse_gc_month,
 )
-from bmm.spotcheck.normalise import RawQuote, raw_quote
+from bmm.spotcheck.normalise import RawQuote, live_quote, raw_quote
 from bmm.spotcheck.safety import (
     SafetyError,
     check_accounts,
@@ -35,7 +37,7 @@ from bmm.spotcheck.safety import (
     check_mode,
     check_port,
 )
-from bmm.spotcheck.source import FutQuote, LadderQuote, SourceError
+from bmm.spotcheck.source import FutQuote, LadderQuote, SizedOptQuote, SourceError
 
 # Lower-case on purpose: matched case-insensitively against dir(ib) / dir(ib.client).
 _ARMED = re.compile(
@@ -90,6 +92,7 @@ class IBSource:
         self._max = max(1, max_lines)
         self._timeout = timeout_s
         self._strikes: dict[tuple[str, str], list[float]] = {}
+        self._log = structlog.get_logger()
 
     @classmethod
     async def connect(
@@ -164,6 +167,22 @@ class IBSource:
             raise SourceError(f"no {venue} data on paper")
         return quotes, [_details_row(cd) for cd in details]
 
+    def _cross_check_month(
+        self, spec: ProductSpec, details: list[dict[str, Any]], qd: date, contract_month: str
+    ) -> None:
+        """The month named in the question (e.g. "Dec-26") must equal the lead-month future's."""
+        months = {
+            m for d in details
+            if (m := parse_gc_month(str(d.get("longName", "")), qd, anchor=None, strict_year=True))
+        }  # fmt: skip
+        if not months:
+            self._log.warning("no contract month named in question text", product=spec.key)
+        elif months != {contract_month}:
+            raise SourceError(
+                f"{spec.key}: question names {sorted(months)} but lead-month future is "
+                f"{contract_month}"
+            )
+
     async def reference_future(
         self,
         spec: ProductSpec,
@@ -183,12 +202,20 @@ class IBSource:
             dates = [date(int(s[:4]), int(s[4:6]), int(s[6:8])) for s in by_date]
             target = lead_month(question_date, dates).strftime("%Y%m%d")
             cd = by_date[target]
+            self._cross_check_month(spec, ladder_details, question_date, cd.contractMonth)
         elif spec.ref_rule == "named_gc":
-            month = next(
-                (m for d in ladder_details
-                 if (m := parse_gc_month(str(d.get("longName", "")), question_date))),
-                gc_month,
-            )  # fmt: skip
+            months = {
+                m for d in ladder_details
+                if (m := parse_gc_month(str(d.get("longName", "")), question_date))
+            }  # fmt: skip
+            if len(months) > 1:
+                raise SourceError(f"ladder names several gold contract months: {sorted(months)}")
+            parsed = next(iter(months), None)
+            if parsed and gc_month and parsed != gc_month:
+                raise SourceError(
+                    f"--gc-month {gc_month} disagrees with the month named in the ladder {parsed}"
+                )
+            month = parsed or gc_month
             if not month:
                 raise SourceError("METLG month unresolved; pass --gc-month")
             futs = await self._details(
@@ -199,7 +226,12 @@ class IBSource:
             )  # fmt: skip
             if not futs:
                 raise SourceError(f"no {spec.fut_symbol} future for {month}")
-            cd = next((f for f in futs if f.contractMonth == month), futs[0])
+            matching = [f for f in futs if f.contractMonth == month]
+            if len(matching) != 1:
+                raise SourceError(
+                    f"{len(matching)} {spec.fut_symbol} futures with contractMonth {month}"
+                )
+            cd = matching[0]
         else:  # under_con_id
             ids = {int(d["underConId"]) for d in ladder_details if d.get("underConId")}
             if len(ids) != 1:
@@ -209,21 +241,26 @@ class IBSource:
                 raise SourceError("underlying future not found")
             cd = futs[0]
         tickers = await self._tickers([cd.contract])
-        q = _quote(tickers[0]) if tickers else raw_quote(None, None, 0, 0)
+        q = live_quote(_quote(tickers[0])) if tickers else raw_quote(None, None, 0, 0)
         c = cd.contract
         month_s = cd.contractMonth or c.lastTradeDateOrContractMonth[:6]
         return FutQuote(c.conId, c.localSymbol, month_s, q)
 
-    async def option_expiries(self, spec: ProductSpec, fut: FutQuote) -> list[OptExpiry]:
+    async def option_expiries(
+        self, spec: ProductSpec, fut: FutQuote, question_date: date | None = None
+    ) -> list[OptExpiry]:
         chains = await self._w(
             self._ib.reqSecDefOptParamsAsync(spec.fut_symbol, spec.opt_exchange, "FUT", fut.con_id)
         )
-        today = ns_to_ct(now_ns()).date()
+        day0 = question_date or ns_to_ct(now_ns()).date()
         horizon = {
-            (today + timedelta(days=i)).strftime("%Y%m%d") for i in range(_DETAIL_WINDOW_DAYS + 1)
+            (day0 + timedelta(days=i)).strftime("%Y%m%d") for i in range(_DETAIL_WINDOW_DAYS + 1)
         }
         out: list[OptExpiry] = []
         for ch in chains or []:
+            if not option_class_ok(spec, str(ch.tradingClass)):
+                self._log.info("option class excluded", cls=ch.tradingClass, product=spec.key)
+                continue
             strikes = sorted(float(k) for k in ch.strikes)
             if not strikes:
                 continue
@@ -234,6 +271,9 @@ class IBSource:
                 )  # fmt: skip
                 cds = await self._details(probe)
                 if not cds or not cds[0].lastTradeTime or not cds[0].underConId:
+                    self._log.warning(
+                        "option expiry dropped (no details)", cls=ch.tradingClass, expiry=exp
+                    )
                     continue  # never guess an expiry time or underlying
                 cd = cds[0]
                 try:
@@ -264,10 +304,20 @@ class IBSource:
         for i in range(0, len(cons), self._max):
             got = await self._w(self._ib.qualifyContractsAsync(*cons[i : i + self._max]))
             qualified += [c for c in got if c is not None and c.conId]
+        if len(qualified) < len(cons):
+            self._log.warning(
+                "option strikes not qualified", expiry=expiry.yyyymmdd,
+                n_missing=len(cons) - len(qualified),
+            )  # fmt: skip
         out: list[OptQuote] = []
         for con, t in zip(qualified, await self._tickers(qualified), strict=False):
-            q = _quote(t)
-            if q.ask is None or (q.bid is not None and q.bid > q.ask):
+            q = live_quote(_quote(t))  # no stale prices from size-0 sides, no crossed quotes
+            if q.ask is None:
                 continue
-            out.append(OptQuote(float(con.strike), q.bid if q.bid is not None else 0.0, q.ask))
+            out.append(
+                SizedOptQuote(
+                    float(con.strike), q.bid if q.bid is not None else 0.0, q.ask,
+                    q.bid_size, q.ask_size,
+                )
+            )  # fmt: skip
         return out

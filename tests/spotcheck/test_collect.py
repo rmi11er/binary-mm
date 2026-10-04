@@ -62,7 +62,9 @@ def test_dry_run_all_products_ok(tmp_path):
     assert time.time() - t0 < 10
     assert status == dict.fromkeys(PRODUCTS, "ok")
     day = tmp_path / "date=2026-10-05"
-    lad, fut, opt = (pl.read_parquet(day / f"{n}.parquet") for n in ("ladder", "futures", "options"))
+    lad, fut, opt = (
+        pl.read_parquet(day / f"{n}.parquet") for n in ("ladder", "futures", "options")
+    )
     assert (day / "contracts.json").exists()
     for key, p in src.session.products.items():
         sub = lad.filter(pl.col("product") == key)
@@ -77,10 +79,14 @@ def test_dry_run_all_products_ok(tmp_path):
     assert set(cme["expiry_role"]) == {"above"}
     # post-fix: ladder rows exist but a matched product has no option rows after its expiry
     fix_ts = ct_to_ns(D, 15, 0)
-    assert lad.filter((pl.col("product") == "forecastex-spx") & (pl.col("ts_ns") > fix_ts)).height > 0
+    assert (
+        lad.filter((pl.col("product") == "forecastex-spx") & (pl.col("ts_ns") > fix_ts)).height > 0
+    )
     assert spx.filter(pl.col("ts_ns") >= fix_ts).height == 0
     assert lad.filter(pl.col("crossed")).height >= 4
-    assert fut.filter(pl.col("product") == "cme-gold").height == len(src.session.products["cme-gold"].snaps)
+    assert fut.filter(pl.col("product") == "cme-gold").height == len(
+        src.session.products["cme-gold"].snaps
+    )
     # ladder strikes are covered by the option window (bracketing)
     snap = lad.filter(pl.col("product") == "forecastex-spx")["snapshot_id"][0]
     ks = lad.filter(pl.col("snapshot_id") == snap)["strike"]
@@ -153,7 +159,7 @@ def test_no_options_for_reference_future_still_writes_ladder_and_futures(tmp_pat
         def __getattr__(self, name):
             return getattr(self.inner, name)
 
-        async def option_expiries(self, spec, fut):
+        async def option_expiries(self, spec, fut, question_date=None):
             return []
 
     _, status = go(NoOpts, products=[PRODUCTS["forecastex-ndx"]], tmp=tmp_path)
@@ -175,5 +181,186 @@ def test_contracts_logged_once_with_assumption_note(tmp_path):
 def test_clock_past_window_takes_no_snapshots(tmp_path):
     vc = VClock(ct(16, 0))
     src = FixtureSource.from_json(SESSION, clock=vc)
-    status = asyncio.run(collect(src, [PRODUCTS["forecastex-spx"]], D, ParquetSink(tmp_path), vc, vc.sleep))
+    status = asyncio.run(
+        collect(src, [PRODUCTS["forecastex-spx"]], D, ParquetSink(tmp_path), vc, vc.sleep)
+    )
     assert status["forecastex-spx"].startswith("no snapshots")
+
+
+# --- quant-review fixes ------------------------------------------------------------------------
+def _read(tmp, name):
+    return pl.read_parquet(tmp / "date=2026-10-05" / f"{name}.parquet")
+
+
+def test_event_contract_class_never_chosen_cme_gold_all_mismatched(tmp_path):
+    src, status = go(products=[PRODUCTS["cme-gold"]], tmp=tmp_path)
+    assert status == {"cme-gold": "ok"}
+    # the fixture lists a decoy ECGC expiry exactly at the fix
+    decoys = [e for e in src.session.products["cme-gold"].expiries if e["trading_class"] == "ECGC"]
+    assert len(decoys) == 1 and decoys[0]["expiry_ts_ns"] == ct(12, 30)
+    opt = _read(tmp_path, "options")
+    assert set(opt["trading_class"]) == {"OG"}
+    assert opt["expiry_mismatch"].all() and set(opt["expiry_role"]) == {"above"}
+
+
+def test_collector_filters_ec_class_even_if_source_returns_it(tmp_path):
+    class Decoy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def option_expiries(self, spec, fut, question_date=None):
+            got = await self.inner.option_expiries(spec, fut, question_date)
+            return [e for e in got if e.trading_class == "ECGC"]  # ONLY the event class
+
+    _, status = go(Decoy, products=[PRODUCTS["cme-gold"]], tmp=tmp_path)
+    assert status == {"cme-gold": "ok"}
+    assert not (tmp_path / "date=2026-10-05/options.parquet").exists()
+
+
+def test_options_table_has_trading_class_sizes_and_times(tmp_path):
+    go(products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    opt = _read(tmp_path, "options")
+    assert set(opt["trading_class"]) == {"ES"}
+    assert opt["call_bid_size"].null_count() == 0 and (opt["call_bid_size"] == 10).all()
+    assert (opt["opt_ts_ns"] >= opt["ts_ns"]).all()
+
+
+class MovingFuture:
+    """Second and later reference_future calls in a snapshot return F + move."""
+
+    def __init__(self, inner, move):
+        self.inner, self.move, self.n = inner, move, {}
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def reference_future(self, spec, qd, details, gc):
+        from dataclasses import replace
+
+        f = await self.inner.reference_future(spec, qd, details, gc)
+        k = (spec.key, self.inner._clock())
+        self.n[k] = self.n.get(k, 0) + 1
+        if self.n[k] == 1:
+            return f
+        q = f.quote
+        return replace(f, quote=replace(q, bid=q.bid + self.move, ask=q.ask + self.move))
+
+
+def test_future_requoted_after_options_und_px_is_mean_and_df_flag(tmp_path):
+    _, status = go(lambda s: MovingFuture(s, 0.2), products=[PRODUCTS["forecastex-spx"]],
+                   tmp=tmp_path)  # fmt: skip
+    assert status == {"forecastex-spx": "ok"}
+    fut, opt = _read(tmp_path, "futures"), _read(tmp_path, "options")
+    pre = fut.filter(pl.col("ts_ns") < FIX)
+    assert (pre["und_px_after"] - pre["und_px_before"]).abs().min() == pytest.approx(0.2, abs=1e-9)
+    j = opt.join(fut.select("snapshot_id", "und_px_before", "und_px_after"), on="snapshot_id")
+    mean = 0.5 * (j["und_px_before"] + j["und_px_after"])
+    assert (j["und_px"] - mean).abs().max() == pytest.approx(0.0, abs=1e-9)
+    # digital delta ~0.019/pt at 3.5h (0.2 pt -> 0.4c, not flagged) and ~0.09/pt at 10 min (-> 1.8c)
+    near = pre.filter(pl.col("ts_ns").is_between(FIX - 10 * 60 * 10**9, FIX - 5 * 60 * 10**9))
+    assert near.height >= 5 and near["df_flag"].all()
+    early = pre.filter(pl.col("ts_ns") < FIX - 3 * 3600 * 10**9)
+    assert early.height > 0 and not early["df_flag"].any()
+
+
+def test_no_df_flag_when_future_does_not_move(tmp_path):
+    go(products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    fut = _read(tmp_path, "futures")
+    assert not fut["df_flag"].any()
+    assert (fut["und_px_before"] == fut["und_px_after"]).all()
+
+
+def test_each_table_records_its_own_fetch_time(tmp_path):
+    class Slow:
+        """A clock that advances 3 s per fetch, like sequential IB requests."""
+
+        def __init__(self, inner, vc):
+            self.inner, self.vc = inner, vc
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def ladder(self, spec, qd):
+            r = await self.inner.ladder(spec, qd)
+            self.vc.t += 3 * 10**9
+            return r
+
+        async def reference_future(self, *a):
+            r = await self.inner.reference_future(*a)
+            self.vc.t += 3 * 10**9
+            return r
+
+    vc = VClock(ct(11, 30))
+    inner = FixtureSource.from_json(SESSION, clock=vc)
+    asyncio.run(collect(Slow(inner, vc), [PRODUCTS["forecastex-spx"]], D, ParquetSink(tmp_path),
+                        vc, vc.sleep))  # fmt: skip
+    lad, fut = _read(tmp_path, "ladder"), _read(tmp_path, "futures")
+    first = lad.filter(pl.col("snapshot_id") == lad["snapshot_id"][0])
+    assert first["ladder_ts_ns"][0] - first["ts_ns"][0] == 3 * 10**9
+    f0 = fut.filter(pl.col("snapshot_id") == lad["snapshot_id"][0])
+    assert f0["fut_ts_ns"][0] - f0["ts_ns"][0] == 6 * 10**9
+
+
+def test_atm_sigma_unresolved_still_fetches_ladder_range(tmp_path):
+    class NoAtm:
+        def __init__(self, inner):
+            self.inner, self.first = inner, {}
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def calls(self, spec, expiry, strikes):
+            k = (spec.key, self.inner._clock())
+            if k not in self.first:  # the ATM probe returns nothing usable
+                self.first[k] = True
+                return []
+            return await self.inner.calls(spec, expiry, strikes)
+
+    _, status = go(NoAtm, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert status == {"forecastex-spx": "ok"}
+    lad, opt = _read(tmp_path, "ladder"), _read(tmp_path, "options")
+    sid = opt["snapshot_id"][0]
+    ks = lad.filter(pl.col("snapshot_id") == sid)["strike"]
+    os_ = opt.filter(pl.col("snapshot_id") == sid)["strike"]
+    assert os_.min() <= ks.min() and os_.max() >= ks.max()
+    assert opt["atm_sigma"].null_count() == 0  # resolved once the wider chain is in
+
+
+def test_edge_strikes_re_extended_after_qualification_drops(tmp_path):
+    class DropEdge:
+        """Drops the lowest strike of any large request, as qualification can."""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def calls(self, spec, expiry, strikes):
+            out = await self.inner.calls(spec, expiry, strikes)
+            if len(strikes) > 5:
+                lo = min(q.strike for q in out)
+                return [q for q in out if q.strike != lo]
+            return out
+
+    _, status = go(DropEdge, products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert status == {"forecastex-spx": "ok"}
+    lad, opt = _read(tmp_path, "ladder"), _read(tmp_path, "options")
+    sid = opt["snapshot_id"][0]
+    ks = lad.filter(pl.col("snapshot_id") == sid)["strike"]
+    assert opt.filter(pl.col("snapshot_id") == sid)["strike"].min() <= ks.min()
+
+
+def test_ladder_has_post_fix_flag_and_none_for_missing_raw_sizes(tmp_path):
+    go(products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    lad = _read(tmp_path, "ladder")
+    assert (lad["post_fix"] == (lad["ts_ns"] >= lad["fix_ts_ns"])).all()
+    assert lad["post_fix"].any() and not lad["post_fix"].all()
+    assert (lad["ladder_ts_ns"] >= lad["ts_ns"]).all()
+    # a raw size is only logged next to a raw price
+    assert lad.filter(pl.col("raw_no_ask").is_null())["raw_no_ask_size"].null_count() == (
+        lad.filter(pl.col("raw_no_ask").is_null()).height
+    )

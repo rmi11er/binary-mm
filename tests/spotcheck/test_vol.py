@@ -72,3 +72,28 @@ def test_strike_window_covers_ladder_and_extends_one_listed_strike():
     assert (lo, hi) == (6470.0, 6530.0)  # ladder range, then one listed strike beyond each edge
     lo2, hi2 = strike_window(F, 0.16, T)
     assert lo2 < F < hi2 and strike_window(F, 0.16, T, listed=listed)[0] <= lo2
+
+
+def test_strike_window_without_sigma_is_ladder_range_plus_one_listed_strike():
+    from bmm.spotcheck.vol import strike_window
+
+    lo, hi = strike_window(6500.0, None, 0.01, ladder_strikes=[6480.0, 6520.0],
+                           listed=[6450.0, 6475.0, 6500.0, 6525.0, 6550.0])  # fmt: skip
+    assert (lo, hi) == (6475.0, 6525.0)
+
+
+def test_digital_delta_matches_finite_difference():
+    import math
+
+    from bmm.spotcheck.vol import black76_call, digital_delta
+
+    F, K, T, s = 6500.0, 6500.0, 30 / 525600, 0.16
+
+    def digital(f):
+        h = 1e-3
+        return -(black76_call(f, K + h, T, s) - black76_call(f, K - h, T, s)) / (2 * h)
+
+    fd = (digital(F + 0.5) - digital(F - 0.5)) / 1.0
+    assert digital_delta(F, K, s, T) == pytest.approx(fd, abs=2e-4)
+    assert digital_delta(F, K, s, T) == pytest.approx(0.0505, abs=2e-3)  # ~0.051/pt at 30 min
+    assert math.isfinite(digital_delta(F, K * 1.01, s, T))

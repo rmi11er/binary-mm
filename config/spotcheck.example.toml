@@ -2,6 +2,10 @@
 # src/bmm/spotcheck/contracts.py; any value here overrides the default.
 # NOTE: ib_symbol / trading_class / exchange mappings are NOT yet confirmed against a live IB
 # contract lookup. Confirm on first connect (research/venue_facts.md marks IB access as [S]).
+# Option chains used as the "fair" surface ALWAYS exclude the product's own trading_class and any
+# class starting with "EC" (event contracts expire at the fix and price at the binary itself).
+# opt_trading_classes = [] means any other class; set e.g. ["OG"] to pin the vanilla class.
+# The vanilla class names below are NOT guessed: confirm them on the first paper connect.
 # This file never sets ports or modes; the port allowlist (4002 only) lives in safety.py.
 
 [products.forecastex-spx]
@@ -36,6 +40,7 @@ opt_exchange = "COMEX"       # to confirm on first connect
 fix_ct = [12, 30]            # venue_facts "Gold reference" [V]: last trading time 12:30 PM CT
 payout_scale = 1.0           # venue_facts "Tick / payout" [V]
 ref_rule = "named_gc"        # venue_facts "Gold reference" [V]: contract month is named in the question text
+# opt_trading_classes = ["OG"]  # vanilla COMEX gold options class: confirm on first paper connect
 
 [products.cme-gold]
 ib_symbol = "GC"             # venue_facts "Access" [S]: FOP, trading class ECGC; symbol to confirm on first connect
@@ -48,3 +53,4 @@ opt_exchange = "COMEX"       # to confirm on first connect
 fix_ct = [12, 30]            # venue_facts "Gold EC settlement window" [S]: window 12:29:00 to 12:30:00 CT
 payout_scale = 1.0           # to confirm on first connect; ScaleError guards a $100 scale
 ref_rule = "under_con_id"    # the EC's own underlying future conId is the reference
+# opt_trading_classes = ["OG"]  # vanilla COMEX gold options class (ECGC is always excluded): confirm on first paper connect

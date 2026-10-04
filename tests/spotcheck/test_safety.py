@@ -126,9 +126,11 @@ def scan(paths):
                     hits.append(f"{where}:dynamic import")
                 if node.func.id in {"getattr", "setattr", "eval", "exec"}:
                     lit = len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
-                    if node.func.id != "getattr" or not lit or "order" in str(
-                        node.args[1].value
-                    ).lower():
+                    if (
+                        node.func.id != "getattr"
+                        or not lit
+                        or "order" in str(node.args[1].value).lower()
+                    ):
                         hits.append(f"{where}:{node.func.id}")
     return hits
 

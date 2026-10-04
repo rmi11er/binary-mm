@@ -16,6 +16,14 @@ class SourceError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SizedOptQuote(OptQuote):
+    """OptQuote (analyze.py, frozen) plus the displayed sizes the collector logs."""
+
+    call_bid_size: int = 0
+    call_ask_size: int = 0
+
+
+@dataclass(frozen=True)
 class LadderQuote:
     strike: float
     right: Literal["C", "P"]  # ForecastEx: YES=C, NO=P. CME: call book and put book
@@ -45,7 +53,9 @@ class MarketDataSource(Protocol):
         gc_month: str | None,
     ) -> FutQuote: ...
 
-    async def option_expiries(self, spec: ProductSpec, fut: FutQuote) -> list[OptExpiry]: ...
+    async def option_expiries(
+        self, spec: ProductSpec, fut: FutQuote, question_date: date | None = None
+    ) -> list[OptExpiry]: ...
 
     async def calls(
         self, spec: ProductSpec, expiry: OptExpiry, strikes: list[float]

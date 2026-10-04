@@ -62,7 +62,7 @@ def atm_sigma(chain: list[OptQuote], F: float, T: float) -> float | None:
 
 def strike_window(
     F: float,
-    sigma: float,
+    sigma: float | None,
     T: float,
     n_sd: float = 4.0,
     ladder_strikes: Sequence[float] | None = None,
@@ -71,7 +71,7 @@ def strike_window(
     """F*exp(+-n_sd*sigma*sqrt(T)), widened to cover the venue ladder's strike range and, when
     `listed` option strikes are given, extended one listed strike beyond each edge so every
     ladder strike is bracketed by option strikes."""
-    w = n_sd * sigma * math.sqrt(T)
+    w = n_sd * sigma * math.sqrt(T) if sigma else 0.0  # sigma unresolved: ladder range only
     lo, hi = F * math.exp(-w), F * math.exp(w)
     if ladder_strikes:
         lo, hi = min(lo, min(ladder_strikes)), max(hi, max(ladder_strikes))
@@ -81,6 +81,13 @@ def strike_window(
         lo = max(below) if below else lo
         hi = min(above) if above else hi
     return lo, hi
+
+
+def digital_delta(F: float, K: float, sigma: float, T: float) -> float:
+    """d/dF of the undiscounted Black-76 digital N(d2): n(d2) / (F sigma sqrt T), per index point."""
+    v = sigma * math.sqrt(T)
+    d2 = (math.log(F / K) - 0.5 * v * v) / v
+    return math.exp(-0.5 * d2 * d2) / math.sqrt(2.0 * math.pi) / (F * v)
 
 
 def year_frac(from_ns: int, to_ns: int) -> float:

@@ -97,3 +97,14 @@ def test_ladder_level_scale_check():
     check_ladder_scale(rows, 1.0)
     ok = [cme_row(4000.0, raw_quote(41.0, 44.0, 1, 1), None, 100.0)]
     check_ladder_scale(ok, 100.0)
+
+
+def test_live_quote_drops_size_zero_and_crossed():
+    from bmm.spotcheck.normalise import live_quote, raw_quote
+
+    q = live_quote(raw_quote(1.0, 1.2, 0, 5, last=1.1, last_size=2))
+    assert q.bid is None and q.ask == 1.2 and q.last == 1.1
+    c = live_quote(raw_quote(2.0, 1.0, 3, 3))
+    assert c.bid is None and c.ask is None
+    ok = live_quote(raw_quote(1.0, 1.2, 4, 5))
+    assert (ok.bid, ok.ask, ok.bid_size, ok.ask_size) == (1.0, 1.2, 4, 5)
