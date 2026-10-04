@@ -32,6 +32,8 @@ LADDER_SCHEMA: dict[str, Any] = {
     "raw_no_bid_size": pl.Int64,
     "raw_no_ask": pl.Float64,
     "raw_no_ask_size": pl.Int64,
+    "raw_no_last": pl.Float64,  # NO/Put ticker last, per $1 like `last`
+    "raw_no_volume": pl.Float64,  # NO/Put ticker volume
     "last": pl.Float64,
     "last_size": pl.Int64,
     "volume": pl.Float64,

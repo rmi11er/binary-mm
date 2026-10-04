@@ -60,6 +60,7 @@ Open items in this table keep the `[?]` tag with a `Searched:` list. Tracked in 
 
 | Item | Status | Detail | Source |
 |---|---|---|---|
+| ForecastEx trade visibility on YES vs NO tickers | [?] | Whether a matched YES/NO execution prints on both tickers is unknown; spotcheck sums both, which may double count. Searched: none yet | — |
 | IBKR paper account id prefix | [?] | Paper accounts conventionally start with "DU"; spotcheck refuses non-DU accounts (fail closed). Not verified from a primary source. Searched: none yet | — |
 
 ## Other venues (context; not in scope for v1)

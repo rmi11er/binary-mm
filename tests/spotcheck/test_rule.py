@@ -230,19 +230,55 @@ def test_na_bucket_is_not_a_rule_bucket():
 def test_info_line_shows_label_with_nonsim_rows_without_changing_the_verdict():
     base = {"1-2": (0.02, 0.1)}  # simultaneous: moderate gaps -> INVESTIGATE
     incl = {"1-2": (0.044, 0.9)}  # including non-simultaneous rows (gap_outside): GO-like
-    v = verdict("x", gaps(base), gaps(base), pl.concat([pers({"1-2": 11.0}), pers({"1-2": 11.0}, "all")]),
-                pl.concat([sizes({"1-2": 40.0}), sizes({"1-2": 40.0}, "all")]), taker(0.3),
-                gap_all_incl=gaps(incl), gap_matched_incl=gaps(incl))
+    v = verdict(
+        "x",
+        gaps(base),
+        gaps(base),
+        pl.concat([pers({"1-2": 11.0}), pers({"1-2": 11.0}, "all")]),
+        pl.concat([sizes({"1-2": 40.0}), sizes({"1-2": 40.0}, "all")]),
+        taker(0.3),
+        gap_all_incl=gaps(incl),
+        gap_matched_incl=gaps(incl),
+    )
     assert v.label == "INVESTIGATE"
     info = [r for r in v.reasons if r.startswith("info:")]
     assert len(info) == 1 and "GO" in info[0] and "non-simultaneous" in info[0]
     assert v.numbers["info.with_nonsim.max_bucket_median_abs_gap"] == 0.044
-    plain = verdict("x", gaps(base), gaps(base), pl.concat([pers({"1-2": 11.0}), pers({"1-2": 11.0}, "all")]),
-                    pl.concat([sizes({"1-2": 40.0}), sizes({"1-2": 40.0}, "all")]), taker(0.3))
+    plain = verdict(
+        "x",
+        gaps(base),
+        gaps(base),
+        pl.concat([pers({"1-2": 11.0}), pers({"1-2": 11.0}, "all")]),
+        pl.concat([sizes({"1-2": 40.0}), sizes({"1-2": 40.0}, "all")]),
+        taker(0.3),
+    )
     assert plain.label == v.label and not any(r.startswith("info:") for r in plain.reasons)
 
 
 def test_empty_simultaneous_bucket_is_investigate():
-    v = verdict("x", gaps({}), gaps({}), pers({}), sizes({}), taker(0.99),
-                gap_all_incl=gaps({"1-2": (0.001, 0.0)}))
+    v = verdict(
+        "x",
+        gaps({}),
+        gaps({}),
+        pers({}),
+        sizes({}),
+        taker(0.99),
+        gap_all_incl=gaps({"1-2": (0.001, 0.0)}),
+    )
     assert v.label == "INVESTIGATE" and "no simultaneous data" in v.reasons[0]
+
+
+def test_info_kill_uses_unadjusted_gaps_and_go_uses_adjusted():
+    """Q-M2: gap_outside shrinks gaps; KILL's 'median < 2c everywhere' is judged on raw gaps."""
+    base = {"1-2": (0.02, 0.1)}
+    adjusted = {"1-2": (0.005, 0.0)}  # gap_outside: tiny, would look like KILL if used for KILL
+    raw = {"1-2": (0.05, 0.9)}
+    per = pl.concat([pers({"1-2": 11.0}), pers({"1-2": 11.0}, "all")])
+    siz = pl.concat([sizes({"1-2": 40.0}), sizes({"1-2": 40.0}, "all")])
+    v = verdict("x", gaps(base), gaps(base), per, siz, taker(0.3), gap_all_incl=gaps(adjusted),
+                gap_matched_incl=gaps(adjusted), gap_all_raw_incl=gaps(raw))  # fmt: skip
+    info = next(r for r in v.reasons if r.startswith("info:"))
+    assert "KILL on the unadjusted" in info and "would give INVESTIGATE" in info  # not KILL
+    v2 = verdict("x", gaps(base), gaps(base), per, siz, taker(0.3), gap_all_incl=gaps(adjusted),
+                 gap_matched_incl=gaps(adjusted))  # fmt: skip
+    assert "would give KILL" in next(r for r in v2.reasons if r.startswith("info:"))

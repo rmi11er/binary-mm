@@ -159,6 +159,15 @@ def _persist_chart(ps: pl.DataFrame, product: str, path: Path) -> None:
     plt.close(fig)
 
 
+def _gap_pair(with_floor: pl.DataFrame, without: pl.DataFrame) -> pl.DataFrame:
+    """The '>2' bucket row with and without tick-floor rows, stacked and labelled."""
+    a = with_floor.filter(pl.col("m_bucket") == ">2").with_columns(m_bucket=pl.lit(">2 (all rows)"))
+    b = without.filter(pl.col("m_bucket") == ">2").with_columns(
+        m_bucket=pl.lit(">2 (fair in 0.01..0.99)")
+    )
+    return pl.concat([a, b])
+
+
 def _with_scope(df: pl.DataFrame, scope: str) -> pl.DataFrame:
     return df.with_columns(scope=pl.lit(scope))
 
@@ -172,7 +181,12 @@ def _section_ladder(lq: pl.DataFrame, product: str) -> str:
 
 
 def write_report(
-    data_root: Path, d_from: date, d_to: date, out_dir: Path, name: str | None = None
+    data_root: Path,
+    d_from: date,
+    d_to: date,
+    out_dir: Path,
+    name: str | None = None,
+    nonsim_threshold: float = 0.01,
 ) -> Path:
     tables = metrics.load(Path(data_root), d_from, d_to)
     if tables["ladder"].height == 0:
@@ -182,7 +196,7 @@ def write_report(
     label = name or f"{d_from.isoformat()}_{d_to.isoformat()}"
     md_path = out_dir / f"spotcheck_{label}.md"
 
-    ef = {f: metrics.edge_frame(tables, f) for f in FEES}
+    ef = {f: metrics.edge_frame(tables, f, nonsim_threshold) for f in FEES}
     efv = ef[rule.VERDICT_FEE]
     efm = efv.filter(~pl.col("expiry_mismatch"))
     present = set(tables["ladder"]["product"].unique().to_list())
@@ -201,15 +215,20 @@ def write_report(
     ns_extra = metrics.nonsim_extra(efv)
     gap_all_incl = metrics.gap_stats(efv, sim="adjusted")
     gap_m_incl = metrics.gap_stats(efm, sim="adjusted")
+    gap_raw_incl = metrics.gap_stats(efv, sim="all")
+    gap_nofloor = metrics.gap_stats(efv, floor_rows=False)
+    share = metrics.sim_share(efv)
     gap_ttf = metrics.gap_stats(efv, by=("ttf_bucket",))
     taker = metrics.taker_stats(efv, FEES)
     taker_ns = metrics.taker_stats(efv, FEES, sim=NS)
     grid = tables["ladder"].select("product", "fix_ts_ns", "ts_ns").unique()  # every snapshot
-    pers_all = metrics.persistence(efv, grid=grid)
-    pers_m = metrics.persistence(efm, grid=grid)  # mismatched snapshots break matched runs
+    # verdict series: non-simultaneous snapshots count via gap_outside (see metrics.persistence)
+    pers_all = metrics.persistence(efv, grid=grid, sim="adjusted")
+    pers_m = metrics.persistence(efm, grid=grid, sim="adjusted")  # mismatched snapshots break runs
     pers_ns = metrics.persistence(efv, grid=grid, sim=NS, value="gap_outside")
     persist = pl.concat([_with_scope(pers_all, "all"), _with_scope(pers_m, "matched")])
-    sz_all, sz_m = metrics.size_at_gap_strikes(efv), metrics.size_at_gap_strikes(efm)
+    sz_all = metrics.size_at_gap_strikes(efv, sim="adjusted")
+    sz_m = metrics.size_at_gap_strikes(efm, sim="adjusted")
     sizes = pl.concat([_with_scope(sz_all, "all"), _with_scope(sz_m, "matched")])
     lq = metrics.ladder_quality(tables)
     pfa = metrics.post_fix_activity(tables, efv)
@@ -228,16 +247,20 @@ def write_report(
         f"- Fee sources: {FEE_SOURCES}",
         f"- Caveat: {OWNER_CAVEAT}",
         "- Gap = venue mid - model-free-anchored fair (`analyze.fair_band`); positive = venue rich.",
-        "- Post-fix rows carry no option rows (the matched expiry is no longer listed), so fair "
-        "for the post-fix window uses the last pre-fix chain for that product. Post-fix rows are "
+        "- Post-fix rows: a matched expiry is no longer listed (no option rows), and a mismatched "
+        "later chain may still have rows but they are deliberately ignored. Fair for the "
+        "post-fix window always uses the last pre-fix chain for that product. Post-fix rows are "
         "excluded from all headline statistics.",
+        f"- Non-simultaneity threshold: |dF| x digital delta > {nonsim_threshold * 100:g}c "
+        "(`--nonsim-threshold`; recomputed from the stored before/after future quotes).",
         "",
     ]
     verdicts: list[tuple[str, rule.Verdict]] = []
     for p in products:
         pf = lambda df, p=p: df.filter(pl.col("product") == p).drop("product")
         v = rule.verdict(p, gap_all, gap_m, persist, sizes, taker,
-                         gap_all_incl=gap_all_incl, gap_matched_incl=gap_m_incl)  # fmt: skip
+                         gap_all_incl=gap_all_incl, gap_matched_incl=gap_m_incl,
+                         gap_all_raw_incl=gap_raw_incl)  # fmt: skip
         verdicts.append((p, v))
         gpng = out_dir / f"spotcheck_{label}_{p}_gap_by_moneyness.png"
         ppng = out_dir / f"spotcheck_{label}_{p}_persistence.png"
@@ -261,10 +284,16 @@ def write_report(
             "enough between its before and after quotes (which bracket the ladder and options once "
             "the future is cached) to shift the digital by more than 1c (`df_flag` False); "
             "**non-simultaneous** when it did, or when the move is unknown (`df_flag` True or "
-            "null). Non-simultaneous snapshots are kept and reported below. Per row, "
+            "null). It is recomputed here from the stored before/after future quotes (the "
+            f"collector's `df_flag` is information only) with threshold {nonsim_threshold * 100:g}c, "
+            "ATM ladder strike, the chain's sigma and T to the fix. **A missing futures row or an "
+            "unknown before/after quote counts as non-simultaneous.** Non-simultaneous "
+            "snapshots are kept and reported below. Per row, "
             "w = |digital delta at the row's own strike| x |dF| widens the fair band, and "
-            "gap outside = sign(gap) x max(|gap| - w, 0). The verdict uses the simultaneous "
-            f"bucket only. Pre-fix snapshots: {n_snaps(p, 'simultaneous')[0]} simultaneous "
+            "gap outside = sign(gap) x max(|gap| - w, 0). The verdict's gap and taker statistics "
+            "use the simultaneous bucket only; its persistence and size inputs also count a "
+            "non-simultaneous snapshot as a hit when |gap outside| > 3c. "
+            f"Pre-fix snapshots: {n_snaps(p, 'simultaneous')[0]} simultaneous "
             f"({n_snaps(p, 'simultaneous')[1]} rows), {n_snaps(p, NS)[0]} non-simultaneous "
             f"({n_snaps(p, NS)[1]} rows).", "",
             "**Simultaneous bucket** by moneyness (pre-fix, non-crossed observations, "
@@ -276,6 +305,12 @@ def write_report(
             "By time to fix (post-fix shown for information only):", "",
             _md(_order_buckets(pf(gap_ttf), "ttf_bucket", metrics.TTF_BUCKETS), gfmt, gren),
             f"![gap by moneyness]({gpng.name})", "",
+            "Simultaneous share of pre-fix snapshots by time to fix:", "",
+            _md(_order_buckets(pf(share), "ttf_bucket", metrics.TTF_BUCKETS), {"share": _pct}),
+            "Tick-floor check: the `>2` bucket with and without rows whose fair is < 0.01 or "
+            "> 0.99 (simultaneous bucket). The rule input is unchanged (rows included); the "
+            "owner decides whether the rule should exclude tick-floor rows:", "",
+            _md(_gap_pair(pf(gap_all), pf(gap_nofloor)), gfmt, gren),
             "**Non-simultaneous bucket**, gap as observed:", "",
             _md(_order_buckets(pf(gap_ns), "m_bucket", metrics.MONEYNESS_BUCKETS), gfmt, gren),
             "Non-simultaneous bucket, gap outside the widened band (what the futures move cannot "
@@ -324,9 +359,10 @@ def write_report(
             out += [
                 f"{a.height} rows beat the bounds after fee {rule.VERDICT_FEE:g} "
                 f"({int(a['suspect'].sum())} suspect: option width > 50% of mid, option fetch more "
-                "than 5 s from the ladder fetch, post-fix, carried chain, or band widening w "
-                "unknown). Edges are on the delta-widened band (w = 0 when the future did not "
-                "move). "
+                "than 60 s from the ladder fetch, post-fix, carried chain, or band widening w "
+                "unknown). Edges are model-free bounds from option bid/ask, widened by a delta "
+                "approximation for the futures move during the fetch (not replication-grade when "
+                "w > 0). "
                 "$ = positive edge x displayed taker-side size x payout scale.", "",
                 _md(pf(arb_tot), {"arb_usd": lambda x: f"{x:.2f}"},
                     {"arb_usd": "arb $ (edge x size)"}),
@@ -349,8 +385,13 @@ def write_report(
         out += ["### 6. Post-settlement window", "",
                 "Post-fix quotes resting and trades (visible only as volume steps); trade price is "
                 "compared with the last pre-fix fair at that strike.", "",
-                _md(pf(pfa), {"median_trade_px_vs_fair": _c, "volume_after_fix": _n},
-                    {"median_trade_px_vs_fair": "median trade px - last fair (c)"})]  # fmt: skip
+                _md(pf(pfa), {"median_trade_px_vs_fair": _c, "median_trade_px_vs_outcome": _c,
+                              "volume_after_fix": _n},
+                    {"median_trade_px_vs_fair": "median trade px - last fair (c)",
+                     "median_trade_px_vs_outcome": "median trade px - settled outcome (c)"}),
+                "Trades are volume steps on both the YES and NO tickers (for ForecastEx it is [?] "
+                "whether a matched execution prints on both, so counts may double count). "
+                "Outcome = 1 if the first post-fix future mid is above the strike.", ""]  # fmt: skip
         out += ["### 7. Expiry mismatch", "",
                 "Share of snapshots priced off an option expiry different from the venue fix, and "
                 "the gap on matched vs mismatched chains (bias_abs > 0: mismatched chains show "
@@ -358,8 +399,9 @@ def write_report(
                 _md(pf(mism), {"share_mismatched": _pct, "median_gap_matched": _c,
                                "median_gap_mismatched": _c, "median_abs_gap_matched": _c,
                                "median_abs_gap_mismatched": _c, "bias_abs": _c}),
-                "Tilt by chain role = median of (mid - fair) x sign(F - K) in cents; compare the "
-                "`below` and `above` roles:", "",
+                "Tilt by chain role = median of (mid - fair) x sign(F - K) in cents. If the "
+                "mismatch drives the gap, a later-expiry (`above`) chain should show tilt > 0 and "
+                "an earlier (`below`) chain tilt < 0:", "",
                 _md(pf(tilt), {"median_tilt": _c})]  # fmt: skip
         nums = pl.DataFrame({"quantity": list(v.numbers), "value": list(v.numbers.values())})
         out += [

@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--data", default="data/spotcheck")
     r.add_argument("--out", default="reports")
     r.add_argument("--name")
+    r.add_argument(
+        "--nonsim-threshold",
+        type=float,
+        default=0.01,
+        help="a snapshot is non-simultaneous when |dF| x digital delta exceeds this",
+    )
     return ap
 
 
@@ -130,7 +136,7 @@ def _report(args: argparse.Namespace) -> int:
     try:
         path = write_report(
             Path(args.data), date.fromisoformat(args.d_from), date.fromisoformat(args.d_to),
-            Path(args.out), args.name,
+            Path(args.out), args.name, nonsim_threshold=args.nonsim_threshold,
         )  # fmt: skip
     except (ValueError, OSError) as e:
         print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)

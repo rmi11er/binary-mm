@@ -32,6 +32,8 @@ GOLDEN_LADDER = {
     "raw_no_bid_size": pl.Int64,
     "raw_no_ask": pl.Float64,
     "raw_no_ask_size": pl.Int64,
+    "raw_no_last": pl.Float64,
+    "raw_no_volume": pl.Float64,
     "last": pl.Float64,
     "last_size": pl.Int64,
     "volume": pl.Float64,
@@ -88,7 +90,7 @@ def _ladder_row(i: int = 0) -> dict:
         "question_date": date(2026, 10, 5), "fix_ts_ns": 2, "strike": 6500.0,
         "yes_bid": 0.47, "yes_ask": None, "bid_size": 30, "ask_size": 25, "crossed": False,
         "post_fix": False, "ladder_ts_ns": 1, "raw_yes_bid": 0.47, "raw_yes_bid_size": 30, "raw_yes_ask": None, "raw_yes_ask_size": 0,
-        "raw_no_bid": 0.5, "raw_no_bid_size": 25, "raw_no_ask": None, "raw_no_ask_size": 0,
+        "raw_no_bid": 0.5, "raw_no_bid_size": 25, "raw_no_ask": None, "raw_no_ask_size": 0, "raw_no_last": None, "raw_no_volume": None,
         "last": None, "last_size": 0, "volume": None, "payout_scale": 1.0,
     }  # fmt: skip
 

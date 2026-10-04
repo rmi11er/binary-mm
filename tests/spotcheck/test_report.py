@@ -124,3 +124,73 @@ def test_section_2_and_3_state_per_snapshot_and_threshold_columns(report):
 def test_section_7_has_tilt_by_role(report):
     s7 = _sections(report[0].read_text())["cme-gold"].split("### 7. Expiry mismatch")[1]
     assert "Tilt by chain role" in s7 and "above" in s7.split("Tilt by chain role")[1]
+
+
+def test_section_2_has_share_by_ttf_and_tick_floor_check(report):
+    s2 = (
+        _sections(report[0].read_text())["forecastex-spx"]
+        .split("### 2. Mid gap vs fair")[1]
+        .split("### 3.")[0]
+    )
+    assert "Simultaneous share of pre-fix snapshots by time to fix" in s2
+    assert ">2 (all rows)" in s2 and ">2 (fair in 0.01..0.99)" in s2
+    assert "owner decides whether the rule should exclude tick-floor rows" in s2
+    assert "missing futures row" in s2 and "counts as non-simultaneous" in s2
+
+
+def test_wording_q_m3_m6_m7(report):
+    md = report[0].read_text()
+    s4 = _sections(md)["forecastex-spx"].split("### 4. Model-free arb edges")[1].split("### 5.")[0]
+    assert "No venue quote beat" in s4 or "not replication-grade when w > 0" in s4
+    s7 = _sections(md)["cme-gold"].split("### 7. Expiry mismatch")[1]
+    assert "tilt > 0" in s7 and "tilt < 0" in s7
+    head = md.split("## forecastex-spx")[0]
+    assert (
+        "deliberately ignored" in head
+        and "Non-simultaneity threshold: |dF| x digital delta > 1c" in head
+    )
+
+
+def test_section_6_has_outcome_column(report):
+    s6 = (
+        _sections(report[0].read_text())["forecastex-spx"]
+        .split("### 6. Post-settlement window")[1]
+        .split("### 7.")[0]
+    )
+    assert "settled outcome" in s6 and "[?]" in s6
+
+
+def test_nonsim_threshold_flag_changes_the_buckets(tmp_path):
+    data = tmp_path / "data"
+    assert main(["spotcheck", "collect", "--fixture", str(SESSION), "--question-date", D.isoformat(),
+                 "--out", str(data)]) == 0  # fmt: skip
+    outs = {}
+    for thr in ("0.01", "0.5"):
+        rc = main(
+            [
+                "spotcheck",
+                "report",
+                "--from",
+                "2026-10-05",
+                "--to",
+                "2026-10-05",
+                "--data",
+                str(data),
+                "--out",
+                str(tmp_path / thr),
+                "--name",
+                "t",
+                "--nonsim-threshold",
+                thr,
+            ]
+        )
+        assert rc == 0
+        outs[thr] = (tmp_path / thr / "spotcheck_t.md").read_text()
+    assert "greater than" not in outs["0.5"]
+    m1 = re.search(
+        r"Pre-fix snapshots: (\d+) simultaneous .*?, (\d+) non-simultaneous", outs["0.01"]
+    )
+    m2 = re.search(
+        r"Pre-fix snapshots: (\d+) simultaneous .*?, (\d+) non-simultaneous", outs["0.5"]
+    )
+    assert int(m1.group(2)) > 0 and int(m2.group(2)) == 0  # 50c threshold: nothing is flagged

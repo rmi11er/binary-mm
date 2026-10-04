@@ -379,10 +379,20 @@ def test_arb_table_flags_wide_options():
 
 
 def test_arb_table_flags_stale_options():
-    ef, t = _arb_ef(ts_lag_ns=6 * 10**9)
+    ef, t = _arb_ef(ts_lag_ns=61 * 10**9)
     a = arb_table(ef, t)
-    assert a["suspect"][0] is True
-    assert a["opt_ts_lag_ms"][0] == pytest.approx(6000.0, abs=1e-6)
+    assert a["suspect"][0] is True  # > ARB_MAX_LAG_S = 60
+    assert a["opt_ts_lag_ms"][0] == pytest.approx(61000.0, abs=1e-6)
+
+
+def test_arb_lag_of_seconds_is_not_suspect_when_w_is_known():
+    """Q-I1: a live 8-30 s option fetch is covered by the widening; only w null or > 60 s counts."""
+    assert metrics.ARB_MAX_LAG_S == 60
+    ef, t = _arb_ef(ts_lag_ns=30 * 10**9)
+    a = arb_table(ef, t)
+    assert a["opt_ts_lag_ms"][0] == pytest.approx(30000.0, abs=1e-6)  # kept as information
+    assert a["suspect"][0] is False
+    assert arb_table(ef.with_columns(w=pl.lit(None, dtype=pl.Float64)), t)["suspect"][0] is True
 
 
 def test_arb_table_skips_non_positive_and_crossed():
@@ -392,7 +402,10 @@ def test_arb_table_skips_non_positive_and_crossed():
 
 
 def _lad_tables(rows):
-    return {"ladder": pl.DataFrame(rows, schema=LADDER_SCHEMA)}
+    return {
+        "ladder": pl.DataFrame(rows, schema=LADDER_SCHEMA),
+        "futures": pl.DataFrame(schema=FUTURES_SCHEMA),
+    }
 
 
 def test_post_fix_activity_counts_volume_steps_after_fix():
@@ -482,8 +495,14 @@ def _ef_days(spec):
 
 def test_persistence_does_not_join_runs_across_days():
     day2 = FIX + 86400 * 10**9
-    ef = _ef_days([(FIX + 10**12, 0, 4, {}), (FIX + 10**12, 1, 4, {}),
-                   (day2 + 10**12, 2, 4, {}), (day2 + 10**12, 3, 4, {})])
+    ef = _ef_days(
+        [
+            (FIX + 10**12, 0, 4, {}),
+            (FIX + 10**12, 1, 4, {}),
+            (day2 + 10**12, 2, 4, {}),
+            (day2 + 10**12, 3, 4, {}),
+        ]
+    )
     # distinct sessions: fix_ts_ns differs, so two runs of 2 (not one of 4)
     p = persistence(ef)
     assert p["n_runs"][0] == 2 and p["max_run"][0] == 2
@@ -525,10 +544,11 @@ def test_arb_lag_uses_real_fetch_timestamps_not_slot_ts():
     a = arb_table(ef, t)
     assert a.height == 1  # venue 0.5 is hugely above the upper bound: sell arb
     assert a["opt_ts_lag_ms"][0] == pytest.approx(8000.0, abs=1e-6)
-    assert a["suspect"][0] is True
     lad2 = [_ladder_row("s0", ts, K, 0.5, 0.52, ladder_ts_ns=ts + 9 * 10**9 + 10**9)]
     t2 = _tables(lad2, opt)
-    assert arb_table(edge_frame(t2, 0.01), t2)["suspect"][0] is False  # 1 s apart
+    assert arb_table(edge_frame(t2, 0.01), t2)["opt_ts_lag_ms"][0] == pytest.approx(
+        1000.0, abs=1e-6
+    )
 
 
 def test_arb_table_labels_post_fix_stale_and_null_w_as_suspect():
@@ -544,17 +564,29 @@ def test_arb_table_labels_post_fix_stale_and_null_w_as_suspect():
 
 def test_arb_usd_totals_split_suspect_and_scale_by_payout():
     ef, t = _arb_ef()
-    ef = ef.with_columns(payout_scale=pl.lit(100.0), arb_sell_edge_w=pl.lit(0.02), bid_size=pl.lit(10))
+    ef = ef.with_columns(
+        payout_scale=pl.lit(100.0), arb_sell_edge_w=pl.lit(0.02), bid_size=pl.lit(10)
+    )
     a = arb_table(ef, t)
     # (0.01 * ask 40 + 0.02 * bid 10) * 100
     assert a["arb_usd"][0] == pytest.approx((0.4 + 0.2) * 100, abs=1e-9)
     tot = metrics.arb_totals(a)
-    assert tot["arb_usd"].sum() == pytest.approx(60.0, abs=1e-6) and tot["suspect"].to_list() == [False]
+    assert tot["arb_usd"].sum() == pytest.approx(60.0, abs=1e-6) and tot["suspect"].to_list() == [
+        False
+    ]
 
 
 def test_taker_capturable_scales_with_payout_and_has_threshold_columns():
-    rows = [{"gap": 0, "i": 0, "take_buy_edge": 0.03, "take_sell_edge": None, "ask_size": 10,
-             "payout_scale": 100.0}]
+    rows = [
+        {
+            "gap": 0,
+            "i": 0,
+            "take_buy_edge": 0.03,
+            "take_sell_edge": None,
+            "ask_size": 10,
+            "payout_scale": 100.0,
+        }
+    ]
     r = taker_stats(_ef(rows), fees=(0.02,)).row(0, named=True)
     assert r["capturable_median"] == pytest.approx(0.03 * 10 * 100, abs=1e-9)
     assert r["capturable_gt_2c_median"] == pytest.approx(30.0, abs=1e-9)
@@ -563,21 +595,40 @@ def test_taker_capturable_scales_with_payout_and_has_threshold_columns():
     assert r2["capturable_gt_1c_median"] > 0 and r2["capturable_gt_2c_median"] == 0.0
 
 
-def test_null_df_flag_is_treated_as_flagged():
+def test_sim_bucket_is_recomputed_from_quotes_not_from_stored_df_flag():
     chain = _chain()
     ts = FIX - 10 * MIN
-    lad = [_ladder_row("s0", ts, 6560.0, 0.12, 0.14), _ladder_row("s1", ts + MIN, 6560.0, 0.12, 0.14),
-           _ladder_row("s2", ts + 2 * MIN, 6560.0, 0.12, 0.14)]
-    opt = [r for i, t in enumerate((ts, ts + MIN, ts + 2 * MIN)) for r in _opt_rows(f"s{i}", t, chain)]
-    fut = []
-    for sid, flag in (("s0", None), ("s1", False), ("s2", True)):
-        r = dict.fromkeys(FUTURES_SCHEMA)
-        r.update(snapshot_id=sid, df_flag=flag)
-        fut.append(r)
+    ids = ("s0", "s1", "s2", "s3")
+    lad = [_ladder_row(sid, ts + i * MIN, 6500.0, 0.5, 0.52) for i, sid in enumerate(ids)]
+    opt = [r for i, sid in enumerate(ids) for r in _opt_rows(sid, ts + i * MIN, chain)]
+    fut = [
+        _fut_row("s0", F0, F0 + 2.0, False),  # stored False but a big move: non-simultaneous
+        _fut_row("s1", F0, F0 + 0.001, True),  # stored True but a tiny move: simultaneous
+        _fut_row("s2", F0, None, None),  # unknown after-quote: non-simultaneous
+        _fut_row("s3", None, None, None),  # unknown: non-simultaneous
+    ]
     ef = edge_frame(_tables(lad, opt, fut), 0.01).sort("ts_ns")
-    assert ef["df_flag"].to_list() == [None, False, True]  # raw values kept
-    assert ef["sim_bucket"].to_list() == ["non-simultaneous", "simultaneous", "non-simultaneous"]
-    assert gap_stats(ef)["n"].sum() == 1  # the simultaneous bucket only
+    assert ef["sim_bucket"].to_list() == ["non-simultaneous", "simultaneous",
+                                          "non-simultaneous", "non-simultaneous"]  # fmt: skip
+    assert ef["df_flag"].to_list() == [False, True, None, None]  # raw values kept as information
+    assert gap_stats(ef)["n"].sum() == 1
+
+
+def test_nonsim_threshold_is_a_parameter():
+    t = _moved_tables([6500.0], move=0.05)  # delta ~0.09/pt x 0.05 pt = 0.45c
+    assert edge_frame(t, 0.01)["sim_bucket"][0] == "simultaneous"  # default 1c
+    assert edge_frame(t, 0.01, nonsim_threshold=0.002)["sim_bucket"][0] == "non-simultaneous"
+    big = _moved_tables([6500.0], move=2.0)
+    assert edge_frame(big, 0.01, nonsim_threshold=0.5)["sim_bucket"][0] == "simultaneous"
+
+
+def test_sim_share_by_ttf_bucket():
+    ef = _ef([{"gap": 1, "i": 0, "ttf_bucket": "<30m"},
+              {"gap": 1, "i": 1, "ttf_bucket": "<30m", "df_flag": True},
+              {"gap": 1, "i": 2, "ttf_bucket": "1-4h"}])  # fmt: skip
+    sh = {r["ttf_bucket"]: r for r in metrics.sim_share(ef).iter_rows(named=True)}
+    assert sh["<30m"]["snapshots"] == 2 and sh["<30m"]["share"] == pytest.approx(0.5, abs=1e-12)
+    assert sh["1-4h"]["share"] == pytest.approx(1.0, abs=1e-12)
 
 
 def test_post_fix_always_uses_last_pre_fix_chain():
@@ -585,8 +636,9 @@ def test_post_fix_always_uses_last_pre_fix_chain():
     far = [OptQuote(q.strike, q.call_bid + 3, q.call_ask + 3) for q in chain]
     t1, t2 = FIX - MIN, FIX + 2 * MIN
     lad = [_ladder_row("s0", t1, 6560.0, 0.12, 0.14), _ladder_row("s1", t2, 6560.0, 0.12, 0.14)]
-    opt = _opt_rows("s0", t1, chain) + _opt_rows("s1", t2, far, role="above", mismatch=True,
-                                                  expiry=FIX + 600 * MIN)
+    opt = _opt_rows("s0", t1, chain) + _opt_rows(
+        "s1", t2, far, role="above", mismatch=True, expiry=FIX + 600 * MIN
+    )
     ef = edge_frame(_tables(lad, opt), 0.01).sort("ts_ns")
     pre, post = ef.row(0, named=True), ef.row(1, named=True)
     assert post["fair"] == pytest.approx(pre["fair"], abs=1e-12)
@@ -595,8 +647,12 @@ def test_post_fix_always_uses_last_pre_fix_chain():
 
 
 def test_gap_stats_has_per_snapshot_columns():
-    rows = [{"gap": 4, "i": 0, "strike": 1.0}, {"gap": 1, "i": 0, "strike": 2.0},
-            {"gap": 5, "i": 1, "strike": 1.0}, {"gap": 5, "i": 1, "strike": 2.0}]
+    rows = [
+        {"gap": 4, "i": 0, "strike": 1.0},
+        {"gap": 1, "i": 0, "strike": 2.0},
+        {"gap": 5, "i": 1, "strike": 1.0},
+        {"gap": 5, "i": 1, "strike": 2.0},
+    ]
     g = gap_stats(_ef(rows)).row(0, named=True)
     assert g["pct_gt_3c"] == pytest.approx(0.75, abs=1e-12)  # per observation
     # snapshot medians: (4,1) -> 2.5c (no), (5,5) -> 5c (yes)
@@ -607,7 +663,7 @@ def test_gap_stats_has_per_snapshot_columns():
 
 def test_mismatch_tilt_by_role():
     rows = [
-        {"gap": 4, "i": 0, "F": 100.0, "strike": 90.0, "expiry_role": "above"},   # K<F: +4
+        {"gap": 4, "i": 0, "F": 100.0, "strike": 90.0, "expiry_role": "above"},  # K<F: +4
         {"gap": 4, "i": 1, "F": 100.0, "strike": 110.0, "expiry_role": "above"},  # K>F: -4
         {"gap": 6, "i": 2, "F": 100.0, "strike": 90.0, "expiry_role": "below"},
         {"gap": 1, "i": 3, "F": 100.0, "strike": 100.0, "expiry_role": "below"},  # K==F: dropped
@@ -710,9 +766,10 @@ def test_sigma_memo_used_when_snapshot_sigma_missing():
     assert ef["w"][1] is not None and ef["w"][1] > 0
 
 
-def test_missing_futures_row_means_simultaneous_with_zero_move():
+def test_missing_futures_row_means_non_simultaneous_with_unknown_w():
     ef = edge_frame(_moved_tables([6560.0], fut=False), 0.01)
-    assert ef["sim_bucket"][0] == "simultaneous" and ef["dF"][0] == 0.0 and ef["w"][0] == 0.0
+    assert ef["sim_bucket"][0] == "non-simultaneous"
+    assert ef["dF"][0] is None and ef["w"][0] is None
 
 
 def test_gap_stats_buckets_and_adjusted():
@@ -733,3 +790,143 @@ def test_gap_stats_buckets_and_adjusted():
     c = metrics.sim_counts(ef)
     assert dict(zip(c["sim_bucket"], c["snapshots"], strict=True)) == {
         "non-simultaneous": 2, "simultaneous": 1}  # fmt: skip
+
+
+# --------------------------------------------------------------- quant review round 1
+def test_persistence_adjusted_counts_nonsim_hit_via_gap_outside():
+    """Q-C1.1: a non-simultaneous snapshot is a hit when |gap_outside| > 3c, breaks the run when
+    gap_outside is null or <= 3c; mismatched / missing snapshots still break runs."""
+    fix = FIX + 10**12
+    ns = {"df_flag": True}
+    rows = [
+        {"gap": 5, "i": 0},
+        {"gap": 5, "i": 1, **ns, "w": 0.01, "gap_outside": 0.04},  # hit
+        {"gap": 5, "i": 2, **ns, "w": 0.01, "gap_outside": 0.04},  # hit
+        {"gap": 5, "i": 3, **ns, "w": 0.04, "gap_outside": 0.01},  # <= thr: breaks
+        {"gap": 5, "i": 4},
+        {"gap": 5, "i": 5, **ns, "w": None, "gap_outside": None},  # null: breaks
+        {"gap": 5, "i": 6},
+    ]
+    ef = _ef(rows).with_columns(fix_ts_ns=pl.lit(fix))
+    p = persistence(ef, sim="adjusted")
+    assert p["max_run"][0] == 3 and p["n_runs"][0] == 3  # runs: [0-2], [4], [6]
+    assert persistence(ef)["max_run"][0] == 1  # the simultaneous-only series is fragmented
+    # a mismatched snapshot (dropped from a matched-only frame) still breaks a run via the grid
+    grid = pl.DataFrame({"product": ["p"] * 7, "fix_ts_ns": [fix] * 7,
+                         "ts_ns": [FIX + i * MIN for i in range(7)]})  # fmt: skip
+    matched = ef.filter(pl.col("snapshot_id") != "s1")
+    assert persistence(matched, sim="adjusted", grid=grid)["max_run"][0] == 1  # [0-2] split
+
+
+def test_size_at_gap_strikes_adjusted_uses_both_buckets():
+    rows = [
+        {"gap": 5, "i": 0, "bid_size": 40},
+        {"gap": 6, "i": 1, "df_flag": True, "w": 0.01, "gap_outside": 0.05, "bid_size": 10},
+    ]
+    assert metrics.size_at_gap_strikes(_ef(rows))["n"][0] == 1
+    s = metrics.size_at_gap_strikes(_ef(rows), sim="adjusted")
+    assert s["n"][0] == 2 and s["median_size"][0] == pytest.approx(25.0, abs=1e-12)
+
+
+def test_gap_stats_floor_rows_and_all_modes():
+    rows = [
+        {"gap": 5, "i": 0, "fair": 0.5},
+        {"gap": 5, "i": 1, "fair": 0.004},
+        {"gap": 5, "i": 2, "fair": 0.995},
+        {"gap": 1, "i": 3, "df_flag": True, "fair": 0.5},
+    ]
+    ef = _ef(rows)
+    assert gap_stats(ef)["n"][0] == 3 and gap_stats(ef, floor_rows=False)["n"][0] == 1
+    assert gap_stats(ef, sim="all")["n"][0] == 4
+
+
+def _two_session_ladder():
+    fix1, fix2 = FIX, FIX + 86400 * 10**9
+    rows = []
+    for fix, vols in ((fix1, [None, None, 5.0, 5.0]), (fix2, [3.0, 3.0, 3.0, 9.0])):
+        for i, v in enumerate(vols):
+            r = _ladder_row(
+                f"{fix}-{i}",
+                fix + (i - 1) * MIN,
+                100.0,
+                0.98,
+                0.99,
+                volume=v,
+                last=0.9 if v else None,
+            )
+            r["fix_ts_ns"] = fix
+            rows.append(r)
+    return rows, fix1, fix2
+
+
+def test_volume_steps_are_windowed_per_session_and_null_is_zero():
+    """Q-I2 (b)/(c): the first trade after null volume counts; day 2's baseline is not a step."""
+    rows, fix1, fix2 = _two_session_ladder()
+    steps = metrics._volume_steps(pl.DataFrame(rows, schema=LADDER_SCHEMA))
+    by = {(r["fix_ts_ns"], r["dv"]) for r in steps.iter_rows(named=True)}
+    assert by == {(fix1, 5.0), (fix2, 6.0)}  # no step from day 1's 5 to day 2's 3
+
+
+def test_volume_zero_is_a_valid_reading():
+    from bmm.spotcheck.normalise import raw_quote
+
+    assert raw_quote(0.4, 0.5, 1, 1, volume=0.0).volume == 0.0
+    assert raw_quote(0.4, 0.5, 1, 1, volume=math.nan).volume is None
+    assert raw_quote(0.4, 0.5, 1, 1, volume=-1.0).volume is None
+    rows = [
+        _ladder_row("a", FIX - MIN, 100.0, 0.5, 0.6, volume=0.0),
+        _ladder_row("b", FIX + MIN, 100.0, 0.98, 0.99, volume=4.0, last=0.97),
+    ]
+    pa = post_fix_activity({**_lad_tables(rows)})
+    assert pa["trades_after_fix"][0] == 1 and pa["volume_after_fix"][0] == pytest.approx(
+        4.0, abs=1e-12
+    )
+
+
+def test_no_book_trades_are_summed_with_yes_equivalent_price():
+    """Q-I2 (d): CME put (NO) trades count too, priced as 1 - last."""
+    rows = [_ladder_row("a", FIX - MIN, 100.0, 0.5, 0.6, volume=0.0, raw_no_volume=0.0),
+            _ladder_row("b", FIX + MIN, 100.0, 0.98, 0.99, volume=0.0, raw_no_volume=7.0,
+                        raw_no_last=0.03)]  # fmt: skip
+    st = metrics._volume_steps(pl.DataFrame(rows, schema=LADDER_SCHEMA))
+    assert st.height == 1 and st["book"][0] == "no"
+    assert st["dv"][0] == pytest.approx(7.0, abs=1e-12) and st["px"][0] == pytest.approx(
+        0.97, abs=1e-12
+    )
+    pa = post_fix_activity(_lad_tables(rows))
+    assert pa["trades_after_fix"][0] == 1
+
+
+def test_post_fix_pre_fair_is_joined_per_session():
+    """Q-I2 (a): day-1 trades compare with day 1's pre-fix fair, not the last day's."""
+    rows, fix1, fix2 = _two_session_ladder()
+    t = _lad_tables(rows)
+    ef = _ef(
+        [
+            {"gap": 1, "i": 0, "ts_ns": fix1 - MIN, "fix_ts_ns": fix1, "fair": 0.60},
+            {"gap": 1, "i": 1, "ts_ns": fix2 - MIN, "fix_ts_ns": fix2, "fair": 0.10},
+        ]
+    )
+    pa = post_fix_activity(t, ef)
+    # day 1 trade px 0.9 vs 0.60 = +0.30; day 2 trade px 0.9 vs 0.10 = +0.80; median 0.55
+    assert pa["median_trade_px_vs_fair"][0] == pytest.approx(0.55, abs=1e-12)
+
+
+def test_trade_price_vs_settled_outcome():
+    """Q-I2 (e): price minus 1{F_fix > K}, F_fix = mid of the first post-fix futures row."""
+    rows = [
+        _ladder_row("a", FIX - MIN, 100.0, 0.5, 0.6, volume=0.0),
+        _ladder_row("b", FIX + MIN, 100.0, 0.98, 0.99, volume=3.0, last=0.97),
+        _ladder_row("c", FIX + 2 * MIN, 120.0, 0.01, 0.02, volume=0.0),
+    ]
+    rows[2]["volume"] = 0.0
+    t = _lad_tables(rows)
+    fr = dict.fromkeys(FUTURES_SCHEMA)
+    fr.update(snapshot_id="b", ts_ns=FIX + MIN, product="p", bid=109.0, ask=111.0)
+    t["futures"] = pl.DataFrame([fr], schema=FUTURES_SCHEMA)
+    pa = post_fix_activity(t)
+    # F_fix = 110 > 100: outcome 1; trade at 0.97 -> -0.03
+    assert pa["median_trade_px_vs_outcome"][0] == pytest.approx(-0.03, abs=1e-12)
+    fr["bid"], fr["ask"] = 89.0, 91.0  # settled below the strike: outcome 0
+    t["futures"] = pl.DataFrame([fr], schema=FUTURES_SCHEMA)
+    assert post_fix_activity(t)["median_trade_px_vs_outcome"][0] == pytest.approx(0.97, abs=1e-12)

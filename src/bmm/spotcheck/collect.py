@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -106,6 +107,8 @@ def _ladder_rows(
             "raw_no_bid_size": _sz(no.bid, no.bid_size) if no else None,
             "raw_no_ask": no.ask if no else None,
             "raw_no_ask_size": _sz(no.ask, no.ask_size) if no else None,
+            "raw_no_last": None if no is None or no.last is None else no.last / scale,
+            "raw_no_volume": no.volume if no else None,
             "last": None if y.last is None else y.last / scale,  # per-$1, like yes_bid
             "last_size": y.last_size, "volume": y.volume, "payout_scale": spec.payout_scale,
         })  # fmt: skip
@@ -133,6 +136,14 @@ def _check_fix_time(
             )  # fmt: skip
 
 
+@dataclass
+class ChainMemo:
+    """Per-session cache (one `collect` call = one question date) of intraday-static chain data."""
+
+    expiries: dict[tuple[str, int], list[Any]] = field(default_factory=dict)
+    strikes: dict[tuple[str, Any], list[float]] = field(default_factory=dict)
+
+
 async def collect_once(
     source: MarketDataSource,
     spec: ProductSpec,
@@ -146,6 +157,7 @@ async def collect_once(
     clock: Callable[[], int] | None = None,
     sigma_memo: dict[str, float] | None = None,
     fut_memo: dict[str, tuple[list[dict[str, Any]], FutQuote]] | None = None,
+    chain_memo: ChainMemo | None = None,
 ) -> None:
     """One snapshot for one product. Raises SourceError/ScaleError/timeouts; writes nothing then.
 
@@ -178,7 +190,7 @@ async def collect_once(
             del fut_memo[spec.key]
             return await collect_once(
                 source, spec, question_date, sink, snapshot_id, ts_ns, gc_month, write_details,
-                log, clock, sigma_memo, fut_memo,
+                log, clock, sigma_memo, fut_memo, chain_memo,
             )  # fmt: skip
         f_before = _mid(fut, spec, log)
         quotes, details = await source.ladder(spec, question_date)
@@ -193,11 +205,16 @@ async def collect_once(
     fq = fut.quote
 
     # vanilla chains only: never the venue's own event-contract class nor any EC* class
-    expiries = [
-        e
-        for e in await source.option_expiries(spec, fut, question_date)
-        if option_class_ok(spec, e.trading_class)
-    ]
+    # The expiry list and each expiry's listed strikes do not change intraday: resolve them once
+    # per (product, future contract); only the option QUOTES are fetched every snapshot.
+    ek = (spec.key, fut.con_id)
+    if chain_memo is not None and ek in chain_memo.expiries:
+        all_expiries = chain_memo.expiries[ek]
+    else:
+        all_expiries = await source.option_expiries(spec, fut, question_date)
+        if chain_memo is not None and all_expiries:
+            chain_memo.expiries[ek] = all_expiries
+    expiries = [e for e in all_expiries if option_class_ok(spec, e.trading_class)]
     match = match_expiry(fix_ts, fut.con_id, expiries)
     chains: list[tuple[Any, str, list[Any], int]] = []  # expiry, role, quotes, completed at
     if match is None:
@@ -209,7 +226,13 @@ async def collect_once(
                 log.warning("option expiry already passed", product=spec.key, role=role)
                 continue
             T = year_frac(ts_ns, expiry.expiry_ts_ns)
-            strikes = sorted(await source.listed_strikes(spec, expiry))
+            sk = (spec.key, expiry)
+            if chain_memo is not None and sk in chain_memo.strikes:
+                strikes = chain_memo.strikes[sk]
+            else:
+                strikes = sorted(await source.listed_strikes(spec, expiry))
+                if chain_memo is not None and strikes:
+                    chain_memo.strikes[sk] = strikes
             if not strikes:
                 continue
             i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - f_before))
@@ -263,7 +286,7 @@ async def collect_once(
                 del fut_memo[spec.key]
                 return await collect_once(
                     source, spec, question_date, sink, snapshot_id, ts_ns, gc_month,
-                    write_details, log, clock, sigma_memo, fut_memo,
+                    write_details, log, clock, sigma_memo, fut_memo, chain_memo,
                 )  # fmt: skip
             log.warning("reference future changed between quotes; snapshot flagged",
                         product=spec.key, before=fut.con_id, after=fut2.con_id)  # fmt: skip
@@ -358,6 +381,7 @@ async def collect(
     last_err = dict.fromkeys(specs, "")
     sigma_memo: dict[str, float] = {}
     fut_memo: dict[str, tuple[list[dict[str, Any]], FutQuote]] = {}
+    chain_memo = ChainMemo()
     active = set(specs)
     while active:
         slots: dict[str, int] = {}
@@ -381,7 +405,7 @@ async def collect(
                 await collect_once(
                     source, specs[k], question_date, sink, f"{k}-{ts}", ts, gc_month,
                     write_details=oks[k] == 0, log=log, clock=clock,
-                    sigma_memo=sigma_memo, fut_memo=fut_memo,
+                    sigma_memo=sigma_memo, fut_memo=fut_memo, chain_memo=chain_memo,
                 )  # fmt: skip
             except SafetyError:
                 raise  # never swallowed: it ends the session

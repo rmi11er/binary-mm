@@ -80,12 +80,16 @@ def verdict(
     *,
     gap_all_incl: pl.DataFrame | None = None,
     gap_matched_incl: pl.DataFrame | None = None,
+    gap_all_raw_incl: pl.DataFrame | None = None,
 ) -> Verdict:
     """`persistence` and `sizes` carry a `scope` column ("matched" or "all"); `taker` has one row
     per (product, fee). Gap frames are metrics.gap_stats output for the SIMULTANEOUS bucket: the
     label is decided on those alone. If `gap_all_incl` / `gap_matched_incl` (gap_stats with
     sim="adjusted": non-simultaneous rows contribute gap_outside) are given, the label the same
-    logic would give with them is appended as an "info:" reason and number. Information only: it
+    logic would give with them is appended as an "info:" reason and number. GO is judged on those
+    adjusted gaps but KILL on `gap_all_raw_incl` (every snapshot, unadjusted mid_gap) when given,
+    because gap_outside only shrinks gaps, which is conservative for GO and anti-conservative for
+    KILL. Information only: it
     never changes the label (persistence, sizes and taker stats stay simultaneous-bucket)."""
     allb = _buckets(gap_all, persistence, sizes, product, "all")
     matched = _buckets(gap_matched_only, persistence, sizes, product, "matched")
@@ -113,18 +117,26 @@ def verdict(
             gap_matched_incl if gap_matched_incl is not None else gap_matched_only,
             persistence, sizes, product, "matched",
         )  # fmt: skip
-        info_label, _ = _decide(ab, mb, le0)
+        kb = (
+            _buckets(gap_all_raw_incl, persistence, sizes, product, "all")
+            if gap_all_raw_incl is not None else ab
+        )  # fmt: skip
+        info_label, _ = _decide(ab, mb, le0, kill_buckets=kb)
         if ab:
             numbers["info.with_nonsim.max_bucket_median_abs_gap"] = max(b.gap for b in ab.values())
         reasons.append(
-            f"info: with non-simultaneous rows included (gap_outside for those) the same rule "
+            "info: with non-simultaneous rows included (GO judged on gap_outside for those rows, "
+            "KILL on the unadjusted mid gaps) the same rule "
             f"would give {info_label}; not used for the verdict"
         )
     return Verdict(label, reasons, numbers)
 
 
 def _decide(
-    allb: dict[str, _Bucket], matched: dict[str, _Bucket], le0: float | None
+    allb: dict[str, _Bucket],
+    matched: dict[str, _Bucket],
+    le0: float | None,
+    kill_buckets: dict[str, _Bucket] | None = None,
 ) -> tuple[Literal["GO", "INVESTIGATE", "KILL"], list[str]]:
     if not allb:
         return "INVESTIGATE", [
@@ -133,7 +145,8 @@ def _decide(
 
     # 1. KILL
     kill: list[str] = []
-    top = max(b.gap for b in allb.values())
+    kb = allb if kill_buckets is None else kill_buckets
+    top = max((b.gap for b in kb.values()), default=0.0)
     if top < KILL_MEDIAN_ABS_GAP - TOL:
         kill.append(
             f"median |gap| < {KILL_MEDIAN_ABS_GAP * 100:g}c in every bucket "

@@ -277,12 +277,52 @@ def make_session(question_date: date, seed: int = 7) -> Session:
     return Session(question_date.isoformat(), seed, prods)
 
 
+def make_latency_session(question_date: date, frac: float = 0.6, seed: int = 11) -> Session:
+    """The default session plus a future path whose move between the first quote and the re-quote
+    shifts the ATM digital by ~3c on about `frac` of the pre-fix ForecastEx snapshots, so those
+    become non-simultaneous at the default 1c threshold. Used with FixtureSource(latency_s=...).
+    Generated in memory; session.json is not touched."""
+    from bmm.spotcheck.vol import digital_delta
+
+    sess = make_session(question_date, seed=7)
+    rng = np.random.default_rng(seed)
+    for key, pd in sess.products.items():
+        if key not in MOVE_PTS:
+            continue
+        p = _P[key]
+        fix = ct_to_ns(question_date, *PRODUCTS[key].fix_ct)
+        for snap in pd.snaps:
+            snap.fut_after = None
+            if snap.ts_ns >= fix - MIN_NS or rng.random() >= frac:
+                continue
+            T = (fix - snap.ts_ns) / YEAR_NS
+            F = snap.fut[4] or p.f0
+            delta = digital_delta(F, F, p.vol0, T)
+            mv = 0.03 / max(delta, 1e-9)
+            b, a, bs, asz, last = snap.fut
+            assert b is not None and a is not None and last is not None
+            snap.fut_after = [b + mv, a + mv, bs, asz, last + mv]
+    return sess
+
+
 class FixtureSource:
     """MarketDataSource over a Session. Serves the latest snapshot with ts <= clock()."""
 
-    def __init__(self, session: Session, clock: Callable[[], int] | None = None) -> None:
+    def __init__(
+        self,
+        session: Session,
+        clock: Callable[[], int] | None = None,
+        latency_s: float = 0.0,
+        advance: Callable[[float], None] | None = None,
+    ) -> None:
+        """`latency_s` > 0 with an `advance(seconds)` callback moves the (virtual) clock forward on
+        every source call, like real fetch latency. The snapshot served stays the one for the slot
+        (selection time = clock - latency accumulated since the clock was last moved by others)."""
         self.session = session
         self._clock: Callable[[], int] = clock or (lambda: 2**62)
+        self._latency_s, self._advance = latency_s, advance
+        self._lat_ns = 0
+        self._last_seen: int | None = None
         self._fut_calls: dict[tuple[str, int], int] = {}
 
     def set_clock(self, clock: Callable[[], int]) -> None:
@@ -301,9 +341,19 @@ class FixtureSource:
         except KeyError:
             raise SourceError(f"fixture has no product {spec.key}") from None
 
+    def _tick(self) -> None:
+        if self._latency_s and self._advance is not None:
+            self._advance(self._latency_s)
+            self._lat_ns += round(self._latency_s * 1e9)
+            self._last_seen = self._clock()
+
     def _snap(self, spec: ProductSpec) -> tuple[ProductData, Snap]:
         p = self._p(spec)
-        i = bisect_right([s.ts_ns for s in p.snaps], self._clock()) - 1
+        now = self._clock()
+        if self._last_seen is not None and now != self._last_seen:
+            self._lat_ns = 0  # someone else (the collector's sleep) moved the clock: new slot
+        self._last_seen = now
+        i = bisect_right([s.ts_ns for s in p.snaps], now - self._lat_ns) - 1
         if i < 0:
             raise SourceError("fixture: no snapshot yet")
         return p, p.snaps[i]
@@ -319,6 +369,7 @@ class FixtureSource:
                 LadderQuote(k, "C", raw_quote(yb, ya, int(bs), int(asz), last, int(lsz or 0), vol))
             )
             out.append(LadderQuote(k, "P", raw_quote(1.0 - ya, 1.0 - yb, int(asz), int(bs))))
+        self._tick()
         return out, [dict(d) for d in p.details]
 
     async def reference_future(
@@ -332,6 +383,7 @@ class FixtureSource:
         n = self._fut_calls.get((spec.key, s.ts_ns), 0) + 1
         self._fut_calls[(spec.key, s.ts_ns)] = n
         b, a, bs, asz, last = s.fut_after if (n >= 2 and s.fut_after) else s.fut
+        self._tick()
         return FutQuote(
             p.fut_con_id, p.fut_local_symbol, p.fut_month,
             raw_quote(b, a, int(bs or 0), int(asz or 0), last),
@@ -341,9 +393,11 @@ class FixtureSource:
         self, spec: ProductSpec, fut: FutQuote, question_date: date | None = None
     ) -> list[OptExpiry]:
         p, _ = self._snap(spec)
+        self._tick()
         return [OptExpiry(**e) for e in p.expiries]  # passed expiries too, like the real secdef
 
     async def listed_strikes(self, spec: ProductSpec, expiry: OptExpiry) -> list[float]:
+        self._tick()
         return list(self._p(spec).opt_strikes)
 
     async def calls(
@@ -352,10 +406,11 @@ class FixtureSource:
         p, s = self._snap(spec)
         data = s.opts.get(_key(expiry))
         if data is None:
-            if expiry.expiry_ts_ns <= self._clock():
+            if expiry.expiry_ts_ns <= self._clock() - self._lat_ns:
                 return []  # expired: nothing qualifies, like IB
             raise SourceError(f"fixture: no option data for {_key(expiry)}")
         by_k = dict(zip(p.opt_strikes, zip(data[0], data[1], strict=True), strict=True))
+        self._tick()
         return [SizedOptQuote(k, *by_k[k], 10, 10) for k in strikes if k in by_k]
 
     async def close(self) -> None:

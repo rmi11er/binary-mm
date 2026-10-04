@@ -476,6 +476,10 @@ class Recorder:
         self.log.append("expiries")
         return await self.inner.option_expiries(*a, **k)
 
+    async def listed_strikes(self, *a):
+        self.log.append("strikes")
+        return await self.inner.listed_strikes(*a)
+
     async def calls(self, *a):
         self.log.append("calls")
         return await self.inner.calls(*a)
@@ -493,10 +497,11 @@ def _order(log):
 def test_future_quoted_before_ladder_from_second_snapshot(tmp_path):
     log: list[str] = []
     go(lambda s: Recorder(s, log), products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    o = [x for x in _order(log) if x != "strikes"]
     # snapshot 1 (unchanged): ladder, future, expiries, calls..., future
-    assert _order(log)[:5] == ["ladder", "future", "expiries", "calls", "future"]
-    # snapshot 2: future, ladder, expiries, calls..., future
-    assert _order(log)[5:10] == ["future", "ladder", "expiries", "calls", "future"]
+    assert o[:5] == ["ladder", "future", "expiries", "calls", "future"]
+    # snapshot 2: future, ladder, calls..., future (expiries and strikes are cached)
+    assert o[5:9] == ["future", "ladder", "calls", "future"]
     fut = _read(tmp_path, "futures")
     assert (fut["fut_before_ts_ns"] <= fut["fut_ts_ns"]).all()
 
@@ -546,7 +551,7 @@ def test_roll_invalidates_cached_future(tmp_path):
     assert status == {"forecastex-spx": "ok"}
     # snapshot 2 (cache hit) sees con_id change on its before-quote: cache dropped, restarted as a
     # first snapshot (ladder before future)
-    o = _order(log)
+    o = [x for x in _order(log) if x != "strikes"]
     assert o[5:8] == ["future", "ladder", "future"]  # dropped before-quote, then first-style order
     assert o[8] == "expiries"
     fut = _read(tmp_path, "futures")
@@ -696,8 +701,9 @@ def test_roll_at_requote_restarts_snapshot(tmp_path):
                    tmp=tmp_path)  # fmt: skip
     assert status == {"forecastex-spx": "ok"}
     o = _order(log)
-    assert o[5:9] == ["future", "ladder", "expiries", "calls"]  # snapshot 2, normal until re-quote
-    assert o[10:13] == ["ladder", "future", "expiries"]  # restarted first-style
+    o = [x for x in o if x != "strikes"]
+    assert o[5:9] == ["future", "ladder", "calls", "future"]  # snapshot 2 until the re-quote
+    assert o[9:12] == ["ladder", "future", "expiries"]  # restarted first-style; new con re-resolves
     assert _read(tmp_path, "futures")["snapshot_id"].n_unique() == 97
 
 
@@ -771,3 +777,42 @@ def test_priceless_rolled_future_on_cached_path_restarts_instead_of_failing(tmp_
                    tmp=tmp_path)  # fmt: skip
     assert status == {"forecastex-spx": "ok"}
     assert _read(tmp_path, "futures")["snapshot_id"].n_unique() == 97
+
+
+def test_expiries_and_strikes_fetched_once_per_session_but_quotes_every_snapshot(tmp_path):
+    log: list[str] = []
+    go(lambda s: Recorder(s, log), products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert log.count("expiries") == 1  # one reqSecDefOptParams + expiry probes per session
+    assert log.count("strikes") == 1
+    assert log.count("ladder") == 97 and log.count("calls") > 97  # quotes every snapshot
+
+
+def test_chain_cache_is_keyed_by_future_contract(tmp_path):
+    log: list[str] = []
+    go(lambda s: Recorder(RollAt(s, 5), log), products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert log.count("expiries") >= 2  # a rolled future re-resolves its chains
+
+
+def test_ladder_logs_no_book_last_and_volume(tmp_path):
+    """Q-I2 (d): the CME put (NO) ticker's last and volume are logged next to the call's."""
+    from dataclasses import replace
+
+    class PutTrades:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def ladder(self, spec, qd):
+            quotes, details = await self.inner.ladder(spec, qd)
+            out = [
+                replace(q, quote=replace(q.quote, last=0.2, volume=3.0)) if q.right == "P" else q
+                for q in quotes
+            ]
+            return out, details
+
+    go(PutTrades, products=[PRODUCTS["cme-gold"]], tmp=tmp_path)
+    lad = _read(tmp_path, "ladder")
+    assert (lad["raw_no_volume"] == 3.0).all() and (lad["raw_no_last"] == 0.2).all()
+    assert lad["volume"].null_count() > 0  # the call side is untouched

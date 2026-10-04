@@ -38,6 +38,13 @@ def clean(px: float | None) -> float | None:
     return float(px)
 
 
+def _vol(v: float | None) -> float | None:
+    """Volume is a size: 0 is a valid reading; only missing, non-finite or negative is None."""
+    if v is None or not math.isfinite(v) or v < 0:
+        return None
+    return float(v)
+
+
 def _size(n: float | None) -> int:
     if n is None or not math.isfinite(n) or n < 0:
         return 0
@@ -60,7 +67,7 @@ def raw_quote(
         ask_size=_size(ask_size),
         last=clean(last),
         last_size=_size(last_size),
-        volume=clean(volume),
+        volume=_vol(volume),
     )
 
 

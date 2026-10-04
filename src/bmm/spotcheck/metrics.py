@@ -4,19 +4,21 @@ Conventions
 - Gap = venue mid - fair (per $1), fair from `analyze.fair_band` on the chosen option chain.
 - Moneyness z = |ln K/F| / (sigma * sqrt T). sigma is the ATM IV the collector inverted with T to
   the chain's *own* expiry; T here is the time to the venue fix (the question horizon).
-- Post-fix rows (ts >= fix) have no option rows, so fair uses the last pre-fix chain for that
-  product and fix; F, sigma and T for the bucket are taken from that same pre-fix snapshot.
+- Post-fix rows (ts >= fix): matched chains have no option rows, and a mismatched later chain
+  may still have some but they are deliberately ignored. Fair always uses the last pre-fix chain
+  for that product and fix; F, sigma and T for the bucket come from that same pre-fix snapshot.
   Post-fix rows are excluded from every headline statistic (they are not a mispricing signal)
   and appear only in the post-fix section and in ttf-bucket breakdowns.
 - Crossed ladder rows are kept in the frame but excluded from gap, taker and persistence stats.
-- Simultaneity: a snapshot is "simultaneous" when futures.df_flag is False, else "non-simultaneous"
-  (True or null). Both buckets are kept and reported. For every row the fair band is widened by
+- Simultaneity (recomputed here from und_px_before/after; the collector's df_flag is information
+  only): a snapshot is "non-simultaneous" when |dF| x digital delta at the ATM ladder strike
+  exceeds the report's threshold (default 1c), or when dF or sigma is unknown (no futures row or
+  a null quote counts as flagged). Both buckets are kept and reported. For every row the fair band is widened by
   w = |digital_delta(F, K_row, sigma, T_fix)| * |und_px_after - und_px_before| (K is the row's own
   strike; sigma is the chain's ATM sigma, else the product's last resolved one; F is the mean of
   the two quotes), lower_w = clip(lower - w), upper_w = clip(upper + w), and the model-free arb
   edges are recomputed on the widened band. gap_outside = sign(gap) * max(|gap| - w, 0). w is null
-  when dF or sigma is unknown (and for post-fix rows). A snapshot with no futures row (hand-built
-  tables) is treated as simultaneous with dF = 0.
+  when dF or sigma is unknown (and for post-fix rows).
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ TTF_BUCKETS = (">4h", "1-4h", "30-60m", "<30m", "post-fix")
 EPS = 1e-12
 H_NS = 3600 * 1_000_000_000
 SUSPECT_REL_WIDTH = 0.5
-SUSPECT_LAG_MS = 5000.0
+ARB_MAX_LAG_S = 60  # option fetch vs ladder fetch: beyond this a row is suspect on lag
 
 EF_SCHEMA: dict[str, Any] = {
     "product": pl.String, "snapshot_id": pl.String, "ts_ns": pl.Int64, "fix_ts_ns": pl.Int64,
@@ -135,14 +137,19 @@ def _select_chains(options: pl.DataFrame, fix_of: dict[str, int]) -> dict[str, _
     return out
 
 
-def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataFrame:
+def edge_frame(
+    tables: dict[str, pl.DataFrame], fee_per_side: float, nonsim_threshold: float = 0.01
+) -> pl.DataFrame:
+    """One row per (snapshot, strike). `sim_bucket` is recomputed here (the collector's df_flag is
+    kept as information): a pre-fix snapshot is non-simultaneous when |und_px_after - und_px_before|
+    x digital delta (F mean, ATM ladder strike, sigma as for w, T to the fix) exceeds
+    `nonsim_threshold`, and also when dF or sigma is unknown (no futures row, null quote)."""
     lad = tables["ladder"]
     snaps = lad.group_by("product", "snapshot_id", "fix_ts_ns").agg(pl.col("ts_ns").first())
     fix_of = {r["snapshot_id"]: r["fix_ts_ns"] for r in snaps.iter_rows(named=True)}
     chains = _select_chains(tables["options"], fix_of)
     fut = tables["futures"]
-    # per snapshot: (und_px_before, und_px_after, df_flag). null df_flag = unknown = flagged;
-    # a snapshot with no futures row is simultaneous with dF = 0.
+    # per snapshot: (und_px_before, und_px_after, df_flag); df_flag is information only here.
     fut_info: dict[str, tuple[float | None, float | None, bool | None]] = {}
     if fut.height and "df_flag" in fut.columns:
         for r in fut.iter_rows(named=True):
@@ -168,18 +175,20 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
             ref_ch, ref_T = ref
             stale = True  # post-fix: fair always from the last pre-fix chain
             ch = ref_ch
-        if sid in fut_info:
-            fb, fa, dfv = fut_info[sid]
-            sim = dfv is False
-            dF = abs(fa - fb) if fa is not None and fb is not None else None
-            F_row = 0.5 * (fa + fb) if fa is not None and fb is not None else None
-        else:
-            sim, dF, F_row = True, 0.0, ref_ch.F
+        fb, fa = (fut_info[sid][0], fut_info[sid][1]) if sid in fut_info else (None, None)
+        dF = abs(fa - fb) if fa is not None and fb is not None else None
+        F_row = 0.5 * (fa + fb) if fa is not None and fb is not None else None
         if ref_ch.sigma is not None and ts < fix:
             sigma_memo[(product, fix)] = ref_ch.sigma
         sig_w = ref_ch.sigma if ref_ch.sigma is not None else sigma_memo.get((product, fix))
-        rows = by_snap[sid].sort("strike").iter_rows(named=True)
-        lrows = list(rows)
+        lrows = list(by_snap[sid].sort("strike").iter_rows(named=True))
+        if ts >= fix:
+            sim = True  # settled: not compared with the surface
+        elif dF is None or F_row is None or sig_w is None or F_row <= 0:
+            sim = False  # unknown move or sigma: non-simultaneous (null means flagged)
+        else:
+            atm_k = min((r["strike"] for r in lrows), key=lambda k: abs(k - F_row))
+            sim = dF * abs(digital_delta(F_row, atm_k, sig_w, ref_T)) <= nonsim_threshold + 1e-12
         ladder = [
             LadderRow(r["strike"], r["yes_bid"], r["yes_ask"], r["bid_size"] or 0,
                       r["ask_size"] or 0) for r in lrows
@@ -232,9 +241,18 @@ def _f(x: Any) -> float:
 
 
 def _headline(ef: pl.DataFrame, sim: str | None = "simultaneous") -> pl.DataFrame:
-    """Pre-fix, non-crossed rows of one simultaneity bucket (None = both)."""
+    """Pre-fix, non-crossed rows of one simultaneity bucket (None or "adjusted" = both)."""
     d = ef.filter((pl.col("ttf_bucket") != "post-fix") & ~pl.col("crossed"))
-    return d if sim is None else d.filter(pl.col("sim_bucket") == sim)
+    return d if sim in (None, "adjusted") else d.filter(pl.col("sim_bucket") == sim)
+
+
+def _adjusted(d: pl.DataFrame) -> pl.DataFrame:
+    """Column `adj`: mid_gap for simultaneous rows, gap_outside for non-simultaneous ones."""
+    return d.with_columns(
+        adj=pl.when(pl.col("sim_bucket") == "simultaneous")
+        .then(pl.col("mid_gap"))
+        .otherwise(pl.col("gap_outside"))
+    )
 
 
 def _order(df: pl.DataFrame) -> pl.DataFrame:
@@ -247,6 +265,7 @@ def gap_stats(
     by: tuple[str, ...] = ("m_bucket",),
     sim: str = "simultaneous",
     value: str = "mid_gap",
+    floor_rows: bool = True,
 ) -> pl.DataFrame:
     """Per product x `by`: n, median_abs_gap, iqr, pct_gt_2c, pct_gt_3c (per observation, i.e. per
     strike-snapshot, on |value|) and pct_snapshots_gt_2c/3c (share of snapshots whose median |value|
@@ -254,8 +273,10 @@ def gap_stats(
 
     `sim` selects the bucket: "simultaneous", "non-simultaneous" or "adjusted" (every snapshot;
     non-simultaneous rows contribute gap_outside, i.e. gap beyond what the future move explains,
-    simultaneous rows their mid_gap). `value` is "mid_gap" or "gap_outside". Crossed rows are
-    always excluded; post-fix rows are excluded unless "ttf_bucket" is in `by`.
+    simultaneous rows their mid_gap), "all" (every snapshot, unadjusted mid_gap). `value` is
+    "mid_gap" or "gap_outside". `floor_rows=False` drops rows whose fair is < 0.01 or > 0.99
+    (tick-floor rows). Crossed rows are always excluded; post-fix rows are excluded unless
+    "ttf_bucket" is in `by`.
     """
     d = ef.filter(~pl.col("crossed"))
     if sim == "adjusted":
@@ -264,9 +285,13 @@ def gap_stats(
             .then(pl.col("mid_gap"))
             .otherwise(pl.col("gap_outside"))
         )
+    elif sim == "all":
+        d = d.with_columns(v=pl.col("mid_gap"))
     else:
         d = d.filter(pl.col("sim_bucket") == sim).with_columns(v=pl.col(value))
     d = d.filter(pl.col("v").is_not_null())
+    if not floor_rows:
+        d = d.filter((pl.col("fair") >= 0.01) & (pl.col("fair") <= 0.99))
     if "ttf_bucket" not in by:
         d = d.filter(pl.col("ttf_bucket") != "post-fix")
     d = d.with_columns(g=pl.col("v").abs())
@@ -290,8 +315,22 @@ def nonsim_extra(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.Da
     """Non-simultaneous bucket: median band widening w and median fetch-interval move dF."""
     d = _headline(ef, "non-simultaneous")
     res = d.group_by("product", *by).agg(
-        median_w=pl.col("w").median(), median_dF=pl.col("dF").median(),
+        median_w=pl.col("w").median(),
+        median_dF=pl.col("dF").median(),
         n_w_null=pl.col("w").is_null().sum(),
+    )
+    return _order(res)
+
+
+def sim_share(ef: pl.DataFrame) -> pl.DataFrame:
+    """Per product x ttf bucket (pre-fix): snapshots, simultaneous snapshots and their share."""
+    d = (
+        _headline(ef, None)
+        .group_by("product", "ttf_bucket", "snapshot_id")
+        .agg(sim=(pl.col("sim_bucket") == "simultaneous").all())
+    )
+    res = d.group_by("product", "ttf_bucket").agg(
+        snapshots=pl.len(), simultaneous=pl.col("sim").sum(), share=pl.col("sim").mean()
     )
     return _order(res)
 
@@ -311,9 +350,11 @@ def size_at_gap_strikes(
 ) -> pl.DataFrame:
     """Per product x m_bucket: median displayed size on the taker side at strikes with |gap| > thr
     (bid size when the venue is rich, ask size when cheap)."""
-    d = _headline(ef, sim).filter(pl.col(value).abs() > thr + EPS)
+    d = _adjusted(_headline(ef, sim))
+    col = "adj" if sim == "adjusted" else value
+    d = d.filter(pl.col(col).abs() > thr + EPS)
     d = d.with_columns(
-        sz=pl.when(pl.col("mid_gap") > 0).then(pl.col("bid_size")).otherwise(pl.col("ask_size"))
+        sz=pl.when(pl.col(col) > 0).then(pl.col("bid_size")).otherwise(pl.col("ask_size"))
     )
     res = d.group_by("product", "m_bucket").agg(
         median_size=pl.col("sz").median().cast(pl.Float64), n=pl.len()
@@ -398,12 +439,15 @@ def persistence(
     `grid` (product, fix_ts_ns, ts_ns: every collected snapshot, e.g. the ladder table) defines
     the snapshot ordinals within each (product, fix). Runs never cross sessions, and any snapshot
     missing from `ef` (dropped, filtered out as mismatched, no chain) breaks a run because its
-    ordinal is skipped. Without `grid`, ordinals come from `ef` itself. A crossed or df_flag row,
-    or |gap| <= thr, also breaks a run, as does a row outside the `sim` bucket. `value` is
-    "mid_gap" (simultaneous bucket) or "gap_outside" (non-simultaneous bucket). A run is attributed to the moneyness bucket of its first
+    ordinal is skipped. Without `grid`, ordinals come from `ef` itself. A crossed row, a null gap
+    or |gap| <= thr also breaks a run, as does a row outside the `sim` bucket. `sim`:
+    "simultaneous" (mid_gap), "non-simultaneous" (`value`, normally "gap_outside") or "adjusted"
+    (the verdict series: simultaneous rows use mid_gap, non-simultaneous rows use gap_outside, so a
+    non-simultaneous snapshot is a hit when |gap_outside| > thr and breaks the run when
+    gap_outside is null or <= thr; conservative because |gap_outside| <= |gap|). A run is attributed to the moneyness bucket of its first
     snapshot. Only pre-fix rows are used.
     """
-    d = ef.filter(pl.col("ttf_bucket") != "post-fix")
+    d = _adjusted(ef.filter(pl.col("ttf_bucket") != "post-fix"))
     src = grid if grid is not None else ef
     ordinal: dict[tuple[str, int, int], int] = {}
     for (prod, fix), g in src.group_by("product", "fix_ts_ns"):
@@ -419,9 +463,9 @@ def persistence(
             o = ordinal[(pname, fix, r["ts_ns"])]
             hit = (
                 (not r["crossed"])
-                and r["sim_bucket"] == sim
-                and r[value] is not None
-                and abs(r[value]) > thr + EPS
+                and (sim == "adjusted" or r["sim_bucket"] == sim)
+                and r["adj" if sim == "adjusted" else value] is not None
+                and abs(r["adj" if sim == "adjusted" else value]) > thr + EPS
             )
             if hit and cur and o == prev + 1:
                 cur += 1
@@ -460,7 +504,8 @@ def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame
     the future did not move). The arb_buy_edge / arb_sell_edge columns hold the widened edges.
     opt_rel_width = widest (ask-bid)/mid among the (up to
     four) option strikes nearest the venue strike. opt_ts_lag_ms = |ladder fetch time - option
-    fetch time|. suspect if width > 0.5, lag > 5 s, w is null (move or sigma unknown), or the row is
+    fetch time| (information; a non-zero lag is expected live and is covered by the delta widening).
+    suspect if width > 0.5, lag > 60 s (ARB_MAX_LAG_S), w is null (move or sigma unknown), or the row is
     post-fix or on a stale (carried) chain. arb_usd = positive widened edge x displayed
     taker-side size x payout_scale. Rows are labelled (post_fix, sim_bucket), not dropped."""
     d = ef.filter(
@@ -488,7 +533,7 @@ def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame
             "bid_size": r["bid_size"], "ask_size": r["ask_size"], "arb_usd": usd,
             "post_fix": post, "df_flag": r["df_flag"],
             "opt_ts_lag_ms": lag, "opt_rel_width": rel,
-            "suspect": rel > SUSPECT_REL_WIDTH or lag > SUSPECT_LAG_MS or post
+            "suspect": rel > SUSPECT_REL_WIDTH or lag > ARB_MAX_LAG_S * 1000 or post
             or r["w"] is None or bool(r["stale_chain"]),
         })  # fmt: skip
     schema = {
@@ -502,10 +547,38 @@ def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame
 
 
 def _volume_steps(lad: pl.DataFrame) -> pl.DataFrame:
-    """One row per positive volume step per (product, strike): ts, delta, last."""
-    d = lad.filter(pl.col("volume").is_not_null()).sort("product", "strike", "ts_ns")
-    d = d.with_columns(dv=pl.col("volume") - pl.col("volume").shift(1).over("product", "strike"))
-    return d.filter(pl.col("dv") > 0)
+    """Positive volume steps per (product, fix_ts_ns, strike) and book, i.e. detected trades.
+
+    Trades are only visible as volume increases. Both tickers are read: YES/Call (`volume`,
+    `last`) and NO/Put (`raw_no_volume`, `1 - raw_no_last` as the YES-equivalent price). Volume is
+    a size, so a null reading is 0 (it only means "nothing reported yet") and the first row of a
+    series is the baseline, not a step. For ForecastEx it is [?] whether a matched YES/NO
+    execution prints on both tickers (venue_facts), so the sum may double count.
+    Columns: product, fix_ts_ns, strike, ts_ns, dv, px, book.
+    """
+    frames = []
+    for book, vcol, pexpr in (
+        ("yes", "volume", pl.col("last")),
+        ("no", "raw_no_volume", 1.0 - pl.col("raw_no_last")),
+    ):
+        if vcol not in lad.columns:
+            continue
+        d = lad.sort("product", "fix_ts_ns", "strike", "ts_ns").with_columns(
+            v=pl.col(vcol).fill_null(0.0), px=pexpr
+        )
+        d = d.with_columns(
+            dv=pl.col("v") - pl.col("v").shift(1).over("product", "fix_ts_ns", "strike")
+        )
+        frames.append(
+            d.filter(pl.col("dv") > 0).select(
+                "product", "fix_ts_ns", "strike", "ts_ns", "dv", "px", pl.lit(book).alias("book")
+            )
+        )
+    if not frames:
+        return pl.DataFrame(schema={"product": pl.String, "fix_ts_ns": pl.Int64,
+                                    "strike": pl.Float64, "ts_ns": pl.Int64, "dv": pl.Float64,
+                                    "px": pl.Float64, "book": pl.String})  # fmt: skip
+    return pl.concat(frames)
 
 
 def ladder_quality(tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
@@ -533,12 +606,32 @@ def ladder_quality(tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
     ).sort("product")
 
 
+def _f_fix(tables: dict[str, pl.DataFrame]) -> dict[tuple[str, int], float]:
+    """Mid of the first post-fix futures row per (product, fix_ts_ns)."""
+    fut, lad = tables["futures"], tables["ladder"]
+    if fut.height == 0:
+        return {}
+    fix_of = lad.group_by("snapshot_id").agg(fix=pl.col("fix_ts_ns").first())
+    d = fut.join(fix_of, on="snapshot_id", how="inner").filter(pl.col("ts_ns") >= pl.col("fix"))
+    out: dict[tuple[str, int], float] = {}
+    for r in d.sort("ts_ns").iter_rows(named=True):
+        key = (r["product"], r["fix"])
+        if key in out:
+            continue
+        if r["bid"] is not None and r["ask"] is not None:
+            out[key] = 0.5 * (r["bid"] + r["ask"])
+        elif r.get("last") is not None:
+            out[key] = r["last"]
+    return out
+
+
 def post_fix_activity(
     tables: dict[str, pl.DataFrame], ef: pl.DataFrame | None = None
 ) -> pl.DataFrame:
     """Per product: ladder rows with a resting quote after the fix, trades after the fix (volume
-    steps, since trades are only visible as volume increases) and their price vs the last pre-fix
-    fair at that strike (needs `ef`; null otherwise)."""
+    steps on both tickers; trades are only visible as volume increases), their price vs the last
+    pre-fix fair at that (fix, strike) (needs `ef`) and vs the settled outcome 1{F_fix > K}, with
+    F_fix the mid of the first post-fix futures row of that fix."""
     lad = tables["ladder"]
     post = lad.filter(pl.col("ts_ns") >= pl.col("fix_ts_ns"))
     resting = post.filter(
@@ -546,16 +639,31 @@ def post_fix_activity(
     ).group_by("product").agg(quotes_resting=pl.len())  # fmt: skip
     steps = _volume_steps(lad).filter(pl.col("ts_ns") >= pl.col("fix_ts_ns"))
     if ef is not None and ef.height:
-        pre = (_headline(ef, None).sort("ts_ns").group_by("product", "strike", maintain_order=True)
-               .agg(pre_fair=pl.col("fair").last()))  # fmt: skip
-        steps = steps.join(pre, on=["product", "strike"], how="left").with_columns(
-            px_vs_fair=pl.col("last") - pl.col("pre_fair")
+        pre = (
+            _headline(ef, None)
+            .sort("ts_ns")
+            .group_by("product", "fix_ts_ns", "strike", maintain_order=True)
+            .agg(pre_fair=pl.col("fair").last())
         )
+        steps = steps.join(pre, on=["product", "fix_ts_ns", "strike"], how="left")
     else:
-        steps = steps.with_columns(px_vs_fair=pl.lit(None, dtype=pl.Float64))
+        steps = steps.with_columns(pre_fair=pl.lit(None, dtype=pl.Float64))
+    f_fix = _f_fix(tables)
+    steps = steps.with_columns(
+        px_vs_fair=pl.col("px") - pl.col("pre_fair"),
+        outcome=pl.struct("product", "fix_ts_ns", "strike").map_elements(
+            lambda r: (
+                None
+                if (r["product"], r["fix_ts_ns"]) not in f_fix
+                else float(f_fix[(r["product"], r["fix_ts_ns"])] > r["strike"])
+            ),
+            return_dtype=pl.Float64,
+        ),
+    ).with_columns(px_vs_outcome=pl.col("px") - pl.col("outcome"))
     tr = steps.group_by("product").agg(
         trades_after_fix=pl.len(), volume_after_fix=pl.col("dv").sum(),
         median_trade_px_vs_fair=pl.col("px_vs_fair").median(),
+        median_trade_px_vs_outcome=pl.col("px_vs_outcome").median(),
     )  # fmt: skip
     prods = lad.select("product").unique()
     out = prods.join(resting, on="product", how="left").join(tr, on="product", how="left")
