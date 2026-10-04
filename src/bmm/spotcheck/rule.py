@@ -77,9 +77,16 @@ def verdict(
     persistence: pl.DataFrame,
     sizes: pl.DataFrame,
     taker: pl.DataFrame,
+    *,
+    gap_all_incl: pl.DataFrame | None = None,
+    gap_matched_incl: pl.DataFrame | None = None,
 ) -> Verdict:
     """`persistence` and `sizes` carry a `scope` column ("matched" or "all"); `taker` has one row
-    per (product, fee). Gap frames are metrics.gap_stats output."""
+    per (product, fee). Gap frames are metrics.gap_stats output for the SIMULTANEOUS bucket: the
+    label is decided on those alone. If `gap_all_incl` / `gap_matched_incl` (gap_stats with
+    sim="adjusted": non-simultaneous rows contribute gap_outside) are given, the label the same
+    logic would give with them is appended as an "info:" reason and number. Information only: it
+    never changes the label (persistence, sizes and taker stats stay simultaneous-bucket)."""
     allb = _buckets(gap_all, persistence, sizes, product, "all")
     matched = _buckets(gap_matched_only, persistence, sizes, product, "matched")
     t = taker.filter((pl.col("product") == product) & (pl.col("fee") - VERDICT_FEE).abs().lt(1e-9))
@@ -99,9 +106,30 @@ def verdict(
     if allb:
         numbers["max_bucket_median_abs_gap"] = max(b.gap for b in allb.values())
 
+    label, reasons = _decide(allb, matched, le0)
+    if gap_all_incl is not None:
+        ab = _buckets(gap_all_incl, persistence, sizes, product, "all")
+        mb = _buckets(
+            gap_matched_incl if gap_matched_incl is not None else gap_matched_only,
+            persistence, sizes, product, "matched",
+        )  # fmt: skip
+        info_label, _ = _decide(ab, mb, le0)
+        if ab:
+            numbers["info.with_nonsim.max_bucket_median_abs_gap"] = max(b.gap for b in ab.values())
+        reasons.append(
+            f"info: with non-simultaneous rows included (gap_outside for those) the same rule "
+            f"would give {info_label}; not used for the verdict"
+        )
+    return Verdict(label, reasons, numbers)
+
+
+def _decide(
+    allb: dict[str, _Bucket], matched: dict[str, _Bucket], le0: float | None
+) -> tuple[Literal["GO", "INVESTIGATE", "KILL"], list[str]]:
     if not allb:
-        return Verdict("INVESTIGATE", ["no data: no usable pre-fix rows for this product"],
-                       numbers)  # fmt: skip
+        return "INVESTIGATE", [
+            "no simultaneous data: no usable pre-fix rows in the simultaneous bucket"
+        ]
 
     # 1. KILL
     kill: list[str] = []
@@ -117,12 +145,12 @@ def verdict(
             f"(> {KILL_PCT_TAKER_LE_0:.0%})"
         )
     if kill:
-        return Verdict("KILL", kill, numbers)
+        return "KILL", kill
 
     # 2. GO, matched-only data
     for name, b in sorted(matched.items()):
         if _gap_ok(b) and _run_ok(b) and _size_ok(b):
-            return Verdict(
+            return (
                 "GO",
                 [
                     (
@@ -131,7 +159,6 @@ def verdict(
                         f"median size {b.size:g}"
                     )
                 ],
-                numbers,
             )  # fmt: skip
 
     # 3. INVESTIGATE: say why GO did not hold
@@ -159,4 +186,4 @@ def verdict(
             )
     if not reasons:
         reasons.append("gaps exist but no bucket reaches the GO thresholds and KILL does not apply")
-    return Verdict("INVESTIGATE", reasons, numbers)
+    return "INVESTIGATE", reasons

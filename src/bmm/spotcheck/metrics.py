@@ -9,9 +9,14 @@ Conventions
   Post-fix rows are excluded from every headline statistic (they are not a mispricing signal)
   and appear only in the post-fix section and in ttf-bucket breakdowns.
 - Crossed ladder rows are kept in the frame but excluded from gap, taker and persistence stats.
-- Snapshots flagged `df_flag` (the future moved enough during the fetch to shift the digital by
-  more than 1c) are kept in the frame and excluded from the same stats. F is the mean of the
-  before/after future quotes (options.und_px).
+- Simultaneity: a snapshot is "simultaneous" when futures.df_flag is False, else "non-simultaneous"
+  (True or null). Both buckets are kept and reported. For every row the fair band is widened by
+  w = |digital_delta(F, K_row, sigma, T_fix)| * |und_px_after - und_px_before| (K is the row's own
+  strike; sigma is the chain's ATM sigma, else the product's last resolved one; F is the mean of
+  the two quotes), lower_w = clip(lower - w), upper_w = clip(upper + w), and the model-free arb
+  edges are recomputed on the widened band. gap_outside = sign(gap) * max(|gap| - w, 0). w is null
+  when dF or sigma is unknown (and for post-fix rows). A snapshot with no futures row (hand-built
+  tables) is treated as simultaneous with dF = 0.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ import polars as pl
 
 from bmm.spotcheck.analyze import LadderRow, OptQuote, edges
 from bmm.spotcheck.schema import FUTURES_SCHEMA, LADDER_SCHEMA, OPTIONS_SCHEMA
-from bmm.spotcheck.vol import year_frac
+from bmm.spotcheck.vol import digital_delta, year_frac
 
 MONEYNESS_BUCKETS = ("<0.5", "0.5-1", "1-2", ">2")  # |ln K/F| / (sigma*sqrt T)
 TTF_BUCKETS = (">4h", "1-4h", "30-60m", "<30m", "post-fix")
@@ -44,7 +49,9 @@ EF_SCHEMA: dict[str, Any] = {
     "arb_sell_edge": pl.Float64, "bid_size": pl.Int64, "ask_size": pl.Int64,
     "F": pl.Float64, "sigma": pl.Float64, "T": pl.Float64, "m_bucket": pl.String,
     "ttf_bucket": pl.String, "expiry_mismatch": pl.Boolean, "crossed": pl.Boolean,
-    "stale_chain": pl.Boolean, "df_flag": pl.Boolean, "opt_snapshot_id": pl.String, "opt_ts_ns": pl.Int64,
+    "stale_chain": pl.Boolean, "df_flag": pl.Boolean, "sim_bucket": pl.String,
+    "dF": pl.Float64, "w": pl.Float64, "lower_w": pl.Float64, "upper_w": pl.Float64,
+    "arb_buy_edge_w": pl.Float64, "arb_sell_edge_w": pl.Float64, "gap_outside": pl.Float64, "opt_snapshot_id": pl.String, "opt_ts_ns": pl.Int64,
     "opt_expiry_ts_ns": pl.Int64, "ladder_ts_ns": pl.Int64, "payout_scale": pl.Float64,
     "expiry_role": pl.String,
 }  # fmt: skip
@@ -134,11 +141,14 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
     fix_of = {r["snapshot_id"]: r["fix_ts_ns"] for r in snaps.iter_rows(named=True)}
     chains = _select_chains(tables["options"], fix_of)
     fut = tables["futures"]
-    # null df_flag = unknown = flagged; a snapshot with no futures row is not flagged
-    flagged = (
-        {r["snapshot_id"] for r in fut.iter_rows(named=True) if r["df_flag"] is not False}
-        if "df_flag" in fut.columns else set()
-    )  # fmt: skip
+    # per snapshot: (und_px_before, und_px_after, df_flag). null df_flag = unknown = flagged;
+    # a snapshot with no futures row is simultaneous with dF = 0.
+    fut_info: dict[str, tuple[float | None, float | None, bool | None]] = {}
+    if fut.height and "df_flag" in fut.columns:
+        for r in fut.iter_rows(named=True):
+            fut_info[r["snapshot_id"]] = (r.get("und_px_before"), r.get("und_px_after"),
+                                          r["df_flag"])  # fmt: skip
+    sigma_memo: dict[tuple[str, int], float] = {}
     by_snap = {k[0]: g for k, g in lad.partition_by("snapshot_id", as_dict=True).items()}
     out: list[dict[str, Any]] = []
     last_pre: dict[tuple[str, int], tuple[_Chain, float]] = {}
@@ -158,6 +168,16 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
             ref_ch, ref_T = ref
             stale = True  # post-fix: fair always from the last pre-fix chain
             ch = ref_ch
+        if sid in fut_info:
+            fb, fa, dfv = fut_info[sid]
+            sim = dfv is False
+            dF = abs(fa - fb) if fa is not None and fb is not None else None
+            F_row = 0.5 * (fa + fb) if fa is not None and fb is not None else None
+        else:
+            sim, dF, F_row = True, 0.0, ref_ch.F
+        if ref_ch.sigma is not None and ts < fix:
+            sigma_memo[(product, fix)] = ref_ch.sigma
+        sig_w = ref_ch.sigma if ref_ch.sigma is not None else sigma_memo.get((product, fix))
         rows = by_snap[sid].sort("strike").iter_rows(named=True)
         lrows = list(rows)
         ladder = [
@@ -167,6 +187,17 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
         by_k = {r["strike"]: r for r in lrows}
         for e in edges(ladder, ch.quotes, fee_per_side):
             lr = by_k[e.strike]
+            w: float | None = None
+            if (dF is not None and F_row is not None and sig_w is not None and ts < fix
+                    and e.strike > 0 and F_row > 0):  # fmt: skip
+                w = abs(digital_delta(F_row, e.strike, sig_w, ref_T)) * dF
+            ww = 0.0 if w is None else w
+            lo_w, up_w = min(max(e.lower - ww, 0.0), 1.0), min(max(e.upper + ww, 0.0), 1.0)
+            fee = fee_per_side
+            gout = (
+                None if w is None or e.mid_gap is None
+                else math.copysign(max(abs(e.mid_gap) - w, 0.0), e.mid_gap)
+            )  # fmt: skip
             out.append({
                 "product": product, "snapshot_id": sid, "ts_ns": ts, "fix_ts_ns": fix,
                 "strike": e.strike, "fee": fee_per_side, "fair": e.fair, "lower": e.lower,
@@ -177,7 +208,13 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
                 "ask_size": e.ask_size, "F": ref_ch.F, "sigma": ref_ch.sigma, "T": ref_T,
                 "m_bucket": moneyness_bucket(e.strike, ref_ch.F, ref_ch.sigma, ref_T),
                 "ttf_bucket": ttf_bucket(ts, fix), "expiry_mismatch": ch.mismatch,
-                "crossed": bool(lr["crossed"]), "stale_chain": stale, "df_flag": sid in flagged,
+                "crossed": bool(lr["crossed"]), "stale_chain": stale,
+                "df_flag": fut_info[sid][2] if sid in fut_info else False,
+                "sim_bucket": "simultaneous" if sim else "non-simultaneous",
+                "dF": dF, "w": w, "lower_w": lo_w, "upper_w": up_w,
+                "arb_buy_edge_w": None if e.yes_ask is None else lo_w - e.yes_ask - fee,
+                "arb_sell_edge_w": None if e.yes_bid is None else e.yes_bid - up_w - fee,
+                "gap_outside": gout,
                 "opt_snapshot_id": ch.snapshot_id, "opt_ts_ns": ch.opt_ts_ns,
                 "opt_expiry_ts_ns": ch.expiry_ts_ns,
                 "ladder_ts_ns": lr["ladder_ts_ns"] if lr["ladder_ts_ns"] is not None else ts,
@@ -194,9 +231,10 @@ def _f(x: Any) -> float:
     return float(x) if x is not None else 0.0
 
 
-def _headline(ef: pl.DataFrame) -> pl.DataFrame:
-    """Pre-fix, non-crossed rows (the population every headline statistic uses)."""
-    return ef.filter((pl.col("ttf_bucket") != "post-fix") & ~pl.col("crossed") & ~pl.col("df_flag"))
+def _headline(ef: pl.DataFrame, sim: str | None = "simultaneous") -> pl.DataFrame:
+    """Pre-fix, non-crossed rows of one simultaneity bucket (None = both)."""
+    d = ef.filter((pl.col("ttf_bucket") != "post-fix") & ~pl.col("crossed"))
+    return d if sim is None else d.filter(pl.col("sim_bucket") == sim)
 
 
 def _order(df: pl.DataFrame) -> pl.DataFrame:
@@ -204,17 +242,34 @@ def _order(df: pl.DataFrame) -> pl.DataFrame:
     return df.sort(keys)
 
 
-def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataFrame:
+def gap_stats(
+    ef: pl.DataFrame,
+    by: tuple[str, ...] = ("m_bucket",),
+    sim: str = "simultaneous",
+    value: str = "mid_gap",
+) -> pl.DataFrame:
     """Per product x `by`: n, median_abs_gap, iqr, pct_gt_2c, pct_gt_3c (per observation, i.e. per
-    strike-snapshot, on |gap|) and pct_snapshots_gt_2c/3c (share of snapshots whose median |gap|
+    strike-snapshot, on |value|) and pct_snapshots_gt_2c/3c (share of snapshots whose median |value|
     over the group exceeds the threshold). The rule uses the per-observation columns.
 
-    Crossed rows are always excluded. Post-fix rows are excluded unless "ttf_bucket" is in `by`.
+    `sim` selects the bucket: "simultaneous", "non-simultaneous" or "adjusted" (every snapshot;
+    non-simultaneous rows contribute gap_outside, i.e. gap beyond what the future move explains,
+    simultaneous rows their mid_gap). `value` is "mid_gap" or "gap_outside". Crossed rows are
+    always excluded; post-fix rows are excluded unless "ttf_bucket" is in `by`.
     """
-    d = ef.filter(~pl.col("crossed") & ~pl.col("df_flag") & pl.col("mid_gap").is_not_null())
+    d = ef.filter(~pl.col("crossed"))
+    if sim == "adjusted":
+        d = d.with_columns(
+            v=pl.when(pl.col("sim_bucket") == "simultaneous")
+            .then(pl.col("mid_gap"))
+            .otherwise(pl.col("gap_outside"))
+        )
+    else:
+        d = d.filter(pl.col("sim_bucket") == sim).with_columns(v=pl.col(value))
+    d = d.filter(pl.col("v").is_not_null())
     if "ttf_bucket" not in by:
         d = d.filter(pl.col("ttf_bucket") != "post-fix")
-    d = d.with_columns(g=pl.col("mid_gap").abs())
+    d = d.with_columns(g=pl.col("v").abs())
     res = d.group_by("product", *by).agg(
         n=pl.len(),
         median_abs_gap=pl.col("g").median(),
@@ -222,7 +277,6 @@ def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataF
         pct_gt_2c=(pl.col("g") > 0.02 + EPS).mean(),
         pct_gt_3c=(pl.col("g") > 0.03 + EPS).mean(),
     )
-    # per snapshot: share of snapshots whose median |gap| over the group's strikes exceeds thr
     snap = d.group_by("product", "snapshot_id", *by).agg(m=pl.col("g").median())
     ps = snap.group_by("product", *by).agg(
         n_snapshots=pl.len(),
@@ -232,10 +286,32 @@ def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataF
     return _order(res.join(ps, on=["product", *by], how="left"))
 
 
-def size_at_gap_strikes(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
+def nonsim_extra(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataFrame:
+    """Non-simultaneous bucket: median band widening w and median fetch-interval move dF."""
+    d = _headline(ef, "non-simultaneous")
+    res = d.group_by("product", *by).agg(
+        median_w=pl.col("w").median(), median_dF=pl.col("dF").median(),
+        n_w_null=pl.col("w").is_null().sum(),
+    )
+    return _order(res)
+
+
+def sim_counts(ef: pl.DataFrame) -> pl.DataFrame:
+    """Snapshots and rows per product x simultaneity bucket (pre-fix, non-crossed)."""
+    d = _headline(ef, None)
+    return (
+        d.group_by("product", "sim_bucket")
+        .agg(snapshots=pl.col("snapshot_id").n_unique(), rows=pl.len())
+        .sort("product", "sim_bucket")
+    )
+
+
+def size_at_gap_strikes(
+    ef: pl.DataFrame, thr: float = 0.03, sim: str = "simultaneous", value: str = "mid_gap"
+) -> pl.DataFrame:
     """Per product x m_bucket: median displayed size on the taker side at strikes with |gap| > thr
     (bid size when the venue is rich, ask size when cheap)."""
-    d = _headline(ef).filter(pl.col("mid_gap").abs() > thr + EPS)
+    d = _headline(ef, sim).filter(pl.col(value).abs() > thr + EPS)
     d = d.with_columns(
         sz=pl.when(pl.col("mid_gap") > 0).then(pl.col("bid_size")).otherwise(pl.col("ask_size"))
     )
@@ -245,13 +321,16 @@ def size_at_gap_strikes(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
     return _order(res)
 
 
-def taker_stats(ef: pl.DataFrame, fees: tuple[float, ...] = (0.01, 0.02)) -> pl.DataFrame:
+def taker_stats(
+    ef: pl.DataFrame, fees: tuple[float, ...] = (0.01, 0.02), sim: str = "simultaneous"
+) -> pl.DataFrame:
     """Per product x fee. Take edges are linear in fee, so any fee is derived from `ef.fee`.
 
     A snapshot's best edge = max over strikes of max(buy, sell). capturable = sum of positive
-    edge x displayed size on the taker side, per snapshot.
+    edge x displayed size on the taker side, per snapshot. `sim` selects the simultaneity bucket;
+    take edges are against the point fair (not the widened band) in both.
     """
-    d = _headline(ef)
+    d = _headline(ef, sim)
     rows: list[dict[str, Any]] = []
     for f in fees:
         shift = pl.lit(f) - pl.col("fee")
@@ -308,7 +387,11 @@ def taker_stats(ef: pl.DataFrame, fees: tuple[float, ...] = (0.01, 0.02)) -> pl.
 
 
 def persistence(
-    ef: pl.DataFrame, thr: float = 0.03, grid: pl.DataFrame | None = None
+    ef: pl.DataFrame,
+    thr: float = 0.03,
+    grid: pl.DataFrame | None = None,
+    sim: str = "simultaneous",
+    value: str = "mid_gap",
 ) -> pl.DataFrame:
     """Runs of consecutive snapshots with |gap| > thr, per (product, fix, strike).
 
@@ -316,7 +399,8 @@ def persistence(
     the snapshot ordinals within each (product, fix). Runs never cross sessions, and any snapshot
     missing from `ef` (dropped, filtered out as mismatched, no chain) breaks a run because its
     ordinal is skipped. Without `grid`, ordinals come from `ef` itself. A crossed or df_flag row,
-    or |gap| <= thr, also breaks a run. A run is attributed to the moneyness bucket of its first
+    or |gap| <= thr, also breaks a run, as does a row outside the `sim` bucket. `value` is
+    "mid_gap" (simultaneous bucket) or "gap_outside" (non-simultaneous bucket). A run is attributed to the moneyness bucket of its first
     snapshot. Only pre-fix rows are used.
     """
     d = ef.filter(pl.col("ttf_bucket") != "post-fix")
@@ -335,9 +419,9 @@ def persistence(
             o = ordinal[(pname, fix, r["ts_ns"])]
             hit = (
                 (not r["crossed"])
-                and (not r["df_flag"])
-                and r["mid_gap"] is not None
-                and abs(r["mid_gap"]) > thr + EPS
+                and r["sim_bucket"] == sim
+                and r[value] is not None
+                and abs(r[value]) > thr + EPS
             )
             if hit and cur and o == prev + 1:
                 cur += 1
@@ -372,13 +456,15 @@ def _opt_widths(options: pl.DataFrame) -> dict[tuple[str, int], list[tuple[float
 
 
 def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
-    """Rows with a positive model-free edge. opt_rel_width = widest (ask-bid)/mid among the (up to
+    """Rows with a positive model-free edge on the DELTA-WIDENED band (arb_*_edge_w; w = 0 when
+    the future did not move). The arb_buy_edge / arb_sell_edge columns hold the widened edges.
+    opt_rel_width = widest (ask-bid)/mid among the (up to
     four) option strikes nearest the venue strike. opt_ts_lag_ms = |ladder fetch time - option
-    fetch time|. suspect if width > 0.5, lag > 5 s, or the row is post-fix, df_flag or on a stale
-    (carried) chain. arb_usd = positive edge x displayed taker-side size x payout_scale.
-    Rows are labelled (post_fix, df_flag), not dropped."""
+    fetch time|. suspect if width > 0.5, lag > 5 s, w is null (move or sigma unknown), or the row is
+    post-fix or on a stale (carried) chain. arb_usd = positive widened edge x displayed
+    taker-side size x payout_scale. Rows are labelled (post_fix, sim_bucket), not dropped."""
     d = ef.filter(
-        ~pl.col("crossed") & ((pl.col("arb_buy_edge") > 0) | (pl.col("arb_sell_edge") > 0))
+        ~pl.col("crossed") & ((pl.col("arb_buy_edge_w") > 0) | (pl.col("arb_sell_edge_w") > 0))
     )
     chains = _opt_widths(tables["options"])
     rows = []
@@ -390,25 +476,26 @@ def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame
         rel = max(w) if w else float("inf")
         lag = abs(r["ladder_ts_ns"] - r["opt_ts_ns"]) / 1e6
         post = r["ttf_bucket"] == "post-fix"
-        buy, sell = r["arb_buy_edge"], r["arb_sell_edge"]
+        buy, sell = r["arb_buy_edge_w"], r["arb_sell_edge_w"]
         usd = (max(buy or 0.0, 0.0) * r["ask_size"] + max(sell or 0.0, 0.0) * r["bid_size"]) * r[
             "payout_scale"
         ]
         rows.append({
             "product": r["product"], "snapshot_id": r["snapshot_id"], "ts_ns": r["ts_ns"],
             "strike": r["strike"], "yes_bid": r["yes_bid"], "yes_ask": r["yes_ask"],
-            "arb_buy_edge": r["arb_buy_edge"], "arb_sell_edge": r["arb_sell_edge"],
+            "arb_buy_edge": buy, "arb_sell_edge": sell, "w": r["w"],
+            "sim_bucket": r["sim_bucket"],
             "bid_size": r["bid_size"], "ask_size": r["ask_size"], "arb_usd": usd,
             "post_fix": post, "df_flag": r["df_flag"],
             "opt_ts_lag_ms": lag, "opt_rel_width": rel,
             "suspect": rel > SUSPECT_REL_WIDTH or lag > SUSPECT_LAG_MS or post
-            or bool(r["df_flag"]) or bool(r["stale_chain"]),
+            or r["w"] is None or bool(r["stale_chain"]),
         })  # fmt: skip
     schema = {
         "product": pl.String, "snapshot_id": pl.String, "ts_ns": pl.Int64, "strike": pl.Float64,
         "yes_bid": pl.Float64, "yes_ask": pl.Float64, "arb_buy_edge": pl.Float64,
-        "arb_sell_edge": pl.Float64, "bid_size": pl.Int64, "ask_size": pl.Int64,
-        "arb_usd": pl.Float64, "post_fix": pl.Boolean, "df_flag": pl.Boolean,
+        "arb_sell_edge": pl.Float64, "w": pl.Float64, "sim_bucket": pl.String,
+        "bid_size": pl.Int64, "ask_size": pl.Int64, "arb_usd": pl.Float64, "post_fix": pl.Boolean, "df_flag": pl.Boolean,
         "opt_ts_lag_ms": pl.Float64, "opt_rel_width": pl.Float64, "suspect": pl.Boolean,
     }  # fmt: skip
     return pl.DataFrame(rows, schema=schema)
@@ -459,7 +546,7 @@ def post_fix_activity(
     ).group_by("product").agg(quotes_resting=pl.len())  # fmt: skip
     steps = _volume_steps(lad).filter(pl.col("ts_ns") >= pl.col("fix_ts_ns"))
     if ef is not None and ef.height:
-        pre = (_headline(ef).sort("ts_ns").group_by("product", "strike", maintain_order=True)
+        pre = (_headline(ef, None).sort("ts_ns").group_by("product", "strike", maintain_order=True)
                .agg(pre_fair=pl.col("fair").last()))  # fmt: skip
         steps = steps.join(pre, on=["product", "strike"], how="left").with_columns(
             px_vs_fair=pl.col("last") - pl.col("pre_fair")

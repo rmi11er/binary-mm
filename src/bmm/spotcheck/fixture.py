@@ -45,6 +45,10 @@ YEAR_NS = 365 * 86400 * 1_000_000_000
 SKEW = 0.8  # vol(K) = vol0 - SKEW * ln(K / F), as in test_analyze
 CROSSED_AT_MIN, TRADES_AT_MIN = -24, (5, 12)
 SIZE_CENTER_VOLUME = 100.0
+# ForecastEx products: at these minutes to the fix the future moves between the first and the
+# re-quote by enough (|dF| x digital delta > 1c) to make the snapshot non-simultaneous.
+MOVE_AT_MIN = (-12, -11)
+MOVE_PTS = {"forecastex-spx": 1.0, "forecastex-ndx": 4.0, "forecastex-gold": 0.5}
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,9 @@ class Snap:
     # per ladder strike: yes_bid, yes_ask, bid_size, ask_size, last, last_size, volume
     ladder: list[list[float | None]]
     opts: dict[str, list[list[float]]] = field(default_factory=dict)  # key -> [bids, asks]
+    # the future as quoted on every request after the first for this snapshot (a move during the
+    # fetch); None = unchanged
+    fut_after: list[float | None] | None = None
 
 
 @dataclass
@@ -228,7 +235,12 @@ def _build_product(key: str, qd: date, seed: int, idx: int) -> ProductData:
             20.0,
             F,
         ]
-        snaps.append(Snap(ts, fut, rows, opts))
+        fut_after: list[float | None] | None = None
+        if off in MOVE_AT_MIN and key in MOVE_PTS:
+            mv = MOVE_PTS[key]
+            fut_after = [round(F - p.tick / 2 + mv, 6), round(F + p.tick / 2 + mv, 6), 20.0, 20.0,
+                         round(F + mv, 6)]  # fmt: skip
+        snaps.append(Snap(ts, fut, rows, opts, fut_after))
 
     month_name = "Dec 2026"
     details: list[dict[str, Any]] = []
@@ -271,6 +283,7 @@ class FixtureSource:
     def __init__(self, session: Session, clock: Callable[[], int] | None = None) -> None:
         self.session = session
         self._clock: Callable[[], int] = clock or (lambda: 2**62)
+        self._fut_calls: dict[tuple[str, int], int] = {}
 
     def set_clock(self, clock: Callable[[], int]) -> None:
         self._clock = clock
@@ -316,7 +329,9 @@ class FixtureSource:
         gc_month: str | None,
     ) -> FutQuote:
         p, s = self._snap(spec)
-        b, a, bs, asz, last = s.fut
+        n = self._fut_calls.get((spec.key, s.ts_ns), 0) + 1
+        self._fut_calls[(spec.key, s.ts_ns)] = n
+        b, a, bs, asz, last = s.fut_after if (n >= 2 and s.fut_after) else s.fut
         return FutQuote(
             p.fut_con_id, p.fut_local_symbol, p.fut_month,
             raw_quote(b, a, int(bs or 0), int(asz or 0), last),

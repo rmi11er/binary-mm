@@ -266,11 +266,16 @@ def test_future_requoted_after_options_und_px_is_mean_and_df_flag(tmp_path):
     assert early.height > 0 and not early["df_flag"].any()
 
 
-def test_no_df_flag_when_future_does_not_move(tmp_path):
+def test_df_flag_only_where_the_fixture_moves_the_future(tmp_path):
     go(products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
     fut = _read(tmp_path, "futures")
-    assert not fut["df_flag"].any()
-    assert (fut["und_px_before"] == fut["und_px_after"]).all()
+    moved = [FIX - 12 * 60 * 10**9, FIX - 11 * 60 * 10**9]
+    assert set(fut.filter(pl.col("df_flag"))["ts_ns"]) == set(moved)
+    rest = fut.filter(~pl.col("ts_ns").is_in(moved))
+    assert (rest["und_px_before"] == rest["und_px_after"]).all()
+    assert not rest["df_flag"].any()
+    mv = fut.filter(pl.col("ts_ns").is_in(moved))
+    assert (mv["und_px_after"] - mv["und_px_before"]).abs().min() == pytest.approx(1.0, abs=1e-9)
 
 
 def test_each_table_records_its_own_fetch_time(tmp_path):
@@ -444,7 +449,9 @@ def test_late_future_quote_flags_the_snapshot(tmp_path):
     fut = _read(tmp_path, "futures").sort("ts_ns")
     pre = fut.filter(pl.col("ts_ns") < FIX)
     assert pre["df_flag"][0] is True  # first snapshot: future quoted 6 s after the ladder
-    assert not pre["df_flag"][1:].any()  # cached: quoted before the ladder, no gate
+    moved = [FIX - 12 * 60 * 10**9, FIX - 11 * 60 * 10**9]  # the fixture's own designed moves
+    rest = pre.filter(~pl.col("ts_ns").is_in(moved))["df_flag"][1:]
+    assert not rest.any()  # cached: quoted before the ladder, no gate
 
 
 # --- pre-merge part 1 ----------------------------------------------------------------------------

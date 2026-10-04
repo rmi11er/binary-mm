@@ -188,22 +188,26 @@ def write_report(
     present = set(tables["ladder"]["product"].unique().to_list())
     products = [k for k in PRODUCTS if k in present] + sorted(present - set(PRODUCTS))
 
-    pre = efv.filter(pl.col("ttf_bucket") != "post-fix")
+    sim_n = metrics.sim_counts(efv)
 
-    def flagged(p: str) -> tuple[int, int]:
-        d = (
-            pre.filter(pl.col("product") == p)
-            .group_by("snapshot_id")
-            .agg(f=pl.col("df_flag").first())
-        )
-        return int(d["f"].sum()), d.height
+    def n_snaps(p: str, b: str) -> tuple[int, int]:
+        d = sim_n.filter((pl.col("product") == p) & (pl.col("sim_bucket") == b))
+        return (int(d["snapshots"][0]), int(d["rows"][0])) if d.height else (0, 0)
 
     gap_all, gap_m = metrics.gap_stats(efv), metrics.gap_stats(efm)
+    NS = "non-simultaneous"
+    gap_ns = metrics.gap_stats(efv, sim=NS)
+    gap_ns_out = metrics.gap_stats(efv, sim=NS, value="gap_outside")
+    ns_extra = metrics.nonsim_extra(efv)
+    gap_all_incl = metrics.gap_stats(efv, sim="adjusted")
+    gap_m_incl = metrics.gap_stats(efm, sim="adjusted")
     gap_ttf = metrics.gap_stats(efv, by=("ttf_bucket",))
     taker = metrics.taker_stats(efv, FEES)
+    taker_ns = metrics.taker_stats(efv, FEES, sim=NS)
     grid = tables["ladder"].select("product", "fix_ts_ns", "ts_ns").unique()  # every snapshot
     pers_all = metrics.persistence(efv, grid=grid)
     pers_m = metrics.persistence(efm, grid=grid)  # mismatched snapshots break matched runs
+    pers_ns = metrics.persistence(efv, grid=grid, sim=NS, value="gap_outside")
     persist = pl.concat([_with_scope(pers_all, "all"), _with_scope(pers_m, "matched")])
     sz_all, sz_m = metrics.size_at_gap_strikes(efv), metrics.size_at_gap_strikes(efm)
     sizes = pl.concat([_with_scope(sz_all, "all"), _with_scope(sz_m, "matched")])
@@ -232,7 +236,8 @@ def write_report(
     verdicts: list[tuple[str, rule.Verdict]] = []
     for p in products:
         pf = lambda df, p=p: df.filter(pl.col("product") == p).drop("product")
-        v = rule.verdict(p, gap_all, gap_m, persist, sizes, taker)
+        v = rule.verdict(p, gap_all, gap_m, persist, sizes, taker,
+                         gap_all_incl=gap_all_incl, gap_matched_incl=gap_m_incl)  # fmt: skip
         verdicts.append((p, v))
         gpng = out_dir / f"spotcheck_{label}_{p}_gap_by_moneyness.png"
         ppng = out_dir / f"spotcheck_{label}_{p}_persistence.png"
@@ -252,11 +257,18 @@ def write_report(
         out += [f"## {p}", "", "### 1. Ladder quality", "", _section_ladder(lq, p)]
         out += [
             "### 2. Mid gap vs fair", "",
-            f"{flagged(p)[0]} of {flagged(p)[1]} pre-fix snapshots excluded from the statistics "
-            "below and from sections 3, 5 and the verdict: `df_flag` (the future moved during the "
-            "fetch by enough to shift the digital by more than 1c). F is the mean of the "
-            "before/after future quotes.", "",
-            "By moneyness bucket (all pre-fix, non-crossed observations, expiry-mismatched "
+            "Simultaneity: a snapshot is **simultaneous** when the reference future did not move "
+            "enough between its before and after quotes (which bracket the ladder and options once "
+            "the future is cached) to shift the digital by more than 1c (`df_flag` False); "
+            "**non-simultaneous** when it did, or when the move is unknown (`df_flag` True or "
+            "null). Non-simultaneous snapshots are kept and reported below. Per row, "
+            "w = |digital delta at the row's own strike| x |dF| widens the fair band, and "
+            "gap outside = sign(gap) x max(|gap| - w, 0). The verdict uses the simultaneous "
+            f"bucket only. Pre-fix snapshots: {n_snaps(p, 'simultaneous')[0]} simultaneous "
+            f"({n_snaps(p, 'simultaneous')[1]} rows), {n_snaps(p, NS)[0]} non-simultaneous "
+            f"({n_snaps(p, NS)[1]} rows).", "",
+            "**Simultaneous bucket** by moneyness (pre-fix, non-crossed observations, "
+            "expiry-mismatched "
             "chains included). `% obs` = share of strike-snapshot observations with |gap| above "
             "the threshold (what the owner rule uses); `% snaps` = share of snapshots whose "
             "median |gap| in the bucket exceeds it:", "",
@@ -264,6 +276,16 @@ def write_report(
             "By time to fix (post-fix shown for information only):", "",
             _md(_order_buckets(pf(gap_ttf), "ttf_bucket", metrics.TTF_BUCKETS), gfmt, gren),
             f"![gap by moneyness]({gpng.name})", "",
+            "**Non-simultaneous bucket**, gap as observed:", "",
+            _md(_order_buckets(pf(gap_ns), "m_bucket", metrics.MONEYNESS_BUCKETS), gfmt, gren),
+            "Non-simultaneous bucket, gap outside the widened band (what the futures move cannot "
+            "explain):", "",
+            _md(_order_buckets(pf(gap_ns_out), "m_bucket", metrics.MONEYNESS_BUCKETS), gfmt, gren),
+            "Median band widening and fetch-interval move:", "",
+            _md(_order_buckets(pf(ns_extra), "m_bucket", metrics.MONEYNESS_BUCKETS),
+                {"median_w": _c, "median_dF": _f4},
+                {"median_w": "median w (c)", "median_dF": "median dF (pts)",
+                 "n_w_null": "rows with w unknown"}),
         ]  # fmt: skip
         tk = pf(taker)
         out += [
@@ -271,7 +293,7 @@ def write_report(
             "Best edge per snapshot = max over strikes of buy (fair - ask - fee) and sell "
             "(bid - fair - fee). Capturable = sum of positive edge x displayed taker-side size x "
             "payout scale, $ per snapshot, at edge threshold 0 (and above 1c and 2c, medians), "
-            "at fee 0.01 and 0.02.", "",
+            "at fee 0.01 and 0.02. Simultaneous bucket (used by the verdict):", "",
             _md(tk, {"fee": lambda x: f"{x:.2f}", "pct_snapshots_best_edge_gt_1c": _pct,
                      "pct_snapshots_best_edge_gt_2c": _pct, "pct_snapshots_best_edge_le_0": _pct,
                      "capturable_median": lambda x: f"{x:.2f}",
@@ -284,6 +306,14 @@ def write_report(
                  "capturable_gt_1c_median": "cap. median, edge > 1c ($)",
                  "capturable_gt_2c_median": "cap. median, edge > 2c ($)",
                  "fee": "fee/side"}),
+            "Non-simultaneous bucket (edges against the point fair, not the widened band):", "",
+            _md(pf(taker_ns), {"fee": lambda x: f"{x:.2f}", "pct_snapshots_best_edge_gt_1c": _pct,
+                               "pct_snapshots_best_edge_gt_2c": _pct,
+                               "pct_snapshots_best_edge_le_0": _pct,
+                               "capturable_median": lambda x: f"{x:.2f}",
+                               "capturable_p90": lambda x: f"{x:.2f}",
+                               "capturable_gt_1c_median": lambda x: f"{x:.2f}",
+                               "capturable_gt_2c_median": lambda x: f"{x:.2f}"}),
         ]  # fmt: skip
         a = pf(arb)
         out += ["### 4. Model-free arb edges", ""]
@@ -294,7 +324,9 @@ def write_report(
             out += [
                 f"{a.height} rows beat the bounds after fee {rule.VERDICT_FEE:g} "
                 f"({int(a['suspect'].sum())} suspect: option width > 50% of mid, option fetch more "
-                "than 5 s from the ladder fetch, post-fix, df_flag or carried chain). "
+                "than 5 s from the ladder fetch, post-fix, carried chain, or band widening w "
+                "unknown). Edges are on the delta-widened band (w = 0 when the future did not "
+                "move). "
                 "$ = positive edge x displayed taker-side size x payout scale.", "",
                 _md(pf(arb_tot), {"arb_usd": lambda x: f"{x:.2f}"},
                     {"arb_usd": "arb $ (edge x size)"}),
@@ -307,8 +339,11 @@ def write_report(
         out += [
             "### 5. Persistence", "",
             "Runs of consecutive snapshots with |gap| > 3c per strike; scope `all` includes "
-            "mismatched chains, `matched` only expiry-matched ones.", "",
+            "mismatched chains, `matched` only expiry-matched ones. Simultaneous bucket (used by "
+            "the verdict; a non-simultaneous snapshot breaks a run):", "",
             _md(_order_buckets(ps, "m_bucket", metrics.MONEYNESS_BUCKETS)),
+            "Non-simultaneous bucket, runs of gap outside the widened band > 3c:", "",
+            _md(_order_buckets(pf(pers_ns), "m_bucket", metrics.MONEYNESS_BUCKETS)),
             f"![persistence]({ppng.name})", "",
         ]  # fmt: skip
         out += ["### 6. Post-settlement window", "",
@@ -342,13 +377,20 @@ def write_report(
 
     out += ["## Summary", ""]
     for p, v in verdicts:
-        keys = [k for k in v.numbers if k.endswith("median_abs_gap")]
+        keys = [k for k in v.numbers if k.endswith("median_abs_gap") and not k.startswith("info.")]
         top = max((v.numbers[k] for k in keys), default=None)
         le0 = v.numbers.get("pct_snapshots_best_edge_le_0")
         drive = f"max bucket median |gap| {top * 100:.2f}c" if top is not None else "no data"
         if le0 is not None:
             drive += f", taker best edge <= 0 in {le0:.0%} of snapshots at fee {rule.VERDICT_FEE:g}"
-        out.append(f"- {p}: **{v.label}** ({drive})")
+        info = next((r for r in v.reasons if r.startswith("info:")), "")
+        tail = ""
+        if info:
+            tail = (
+                "; with non-simultaneous rows included: "
+                + info.split("would give ")[1].split(";")[0]
+            )
+        out.append(f"- {p}: **{v.label}** ({drive}{tail})")
     out.append("")
     md_path.write_text("\n".join(out))
     return md_path

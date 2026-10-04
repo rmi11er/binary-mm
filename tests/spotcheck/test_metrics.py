@@ -230,6 +230,19 @@ def _ef(rows):
         }
         d.update({k: v for k, v in r.items() if k not in ("gap", "i")})
         d["ladder_ts_ns"] = r.get("ladder_ts_ns", d["ts_ns"])
+        # simultaneity / widening defaults: simultaneous, dF = w = 0, widened band == band
+        d.setdefault("sim_bucket", "simultaneous" if d["df_flag"] is False else "non-simultaneous")
+        if "sim_bucket" not in r:
+            d["sim_bucket"] = "simultaneous" if d["df_flag"] is False else "non-simultaneous"
+        d.setdefault("dF", 0.0)
+        d.setdefault("w", 0.0)
+        d.setdefault("lower_w", d["lower"])
+        d.setdefault("upper_w", d["upper"])
+        d.setdefault("arb_buy_edge_w", d["arb_buy_edge"])
+        d.setdefault("arb_sell_edge_w", d["arb_sell_edge"])
+        if "gap_outside" not in d:
+            g, w = d["mid_gap"], d["w"]
+            d["gap_outside"] = None if w is None else (1 if g >= 0 else -1) * max(abs(g) - w, 0.0)
         out.append(d)
     return pl.DataFrame(out, schema=metrics.EF_SCHEMA)
 
@@ -374,7 +387,7 @@ def test_arb_table_flags_stale_options():
 
 def test_arb_table_skips_non_positive_and_crossed():
     ef, t = _arb_ef()
-    assert arb_table(ef.with_columns(arb_buy_edge=pl.lit(-0.01)), t).height == 0
+    assert arb_table(ef.with_columns(arb_buy_edge_w=pl.lit(-0.01)), t).height == 0
     assert arb_table(ef.with_columns(crossed=pl.lit(True)), t).height == 0
 
 
@@ -437,10 +450,11 @@ def test_mismatch_share_and_bias():
     assert m["bias_abs"] == pytest.approx(0.03, abs=1e-12)
 
 
-def test_df_flag_snapshots_excluded_from_gap_and_persistence():
+def test_non_simultaneous_snapshots_leave_the_simultaneous_stats_but_are_kept():
     ef = _ef([{"gap": 4, "i": 0}, {"gap": 4, "i": 1, "df_flag": True}, {"gap": 4, "i": 2}])
     assert gap_stats(ef)["n"].sum() == 2
-    assert persistence(ef)["max_run"][0] == 1  # the flagged snapshot breaks the run
+    assert gap_stats(ef, sim="non-simultaneous")["n"].sum() == 1
+    assert persistence(ef)["max_run"][0] == 1  # the non-simultaneous snapshot breaks the run
 
 
 def test_edge_frame_carries_df_flag_from_futures():
@@ -517,17 +531,20 @@ def test_arb_lag_uses_real_fetch_timestamps_not_slot_ts():
     assert arb_table(edge_frame(t2, 0.01), t2)["suspect"][0] is False  # 1 s apart
 
 
-def test_arb_table_labels_post_fix_df_flag_and_stale_as_suspect():
+def test_arb_table_labels_post_fix_stale_and_null_w_as_suspect():
     ef, t = _arb_ef()
-    assert arb_table(ef.with_columns(df_flag=pl.lit(True)), t)["suspect"][0] is True
     assert arb_table(ef.with_columns(stale_chain=pl.lit(True)), t)["suspect"][0] is True
+    assert arb_table(ef.with_columns(w=pl.lit(None, dtype=pl.Float64)), t)["suspect"][0] is True
     a = arb_table(ef.with_columns(ttf_bucket=pl.lit("post-fix")), t)
     assert a["suspect"][0] is True and a["post_fix"][0] is True
+    # a flagged snapshot whose move is known (w not null) is handled by widening, not suspect
+    f = arb_table(ef.with_columns(df_flag=pl.lit(True), sim_bucket=pl.lit("non-simultaneous")), t)
+    assert f["suspect"][0] is False and f["sim_bucket"][0] == "non-simultaneous"
 
 
 def test_arb_usd_totals_split_suspect_and_scale_by_payout():
     ef, t = _arb_ef()
-    ef = ef.with_columns(payout_scale=pl.lit(100.0), arb_sell_edge=pl.lit(0.02), bid_size=pl.lit(10))
+    ef = ef.with_columns(payout_scale=pl.lit(100.0), arb_sell_edge_w=pl.lit(0.02), bid_size=pl.lit(10))
     a = arb_table(ef, t)
     # (0.01 * ask 40 + 0.02 * bid 10) * 100
     assert a["arb_usd"][0] == pytest.approx((0.4 + 0.2) * 100, abs=1e-9)
@@ -558,8 +575,9 @@ def test_null_df_flag_is_treated_as_flagged():
         r.update(snapshot_id=sid, df_flag=flag)
         fut.append(r)
     ef = edge_frame(_tables(lad, opt, fut), 0.01).sort("ts_ns")
-    assert ef["df_flag"].to_list() == [True, False, True]
-    assert gap_stats(ef)["n"].sum() == 1
+    assert ef["df_flag"].to_list() == [None, False, True]  # raw values kept
+    assert ef["sim_bucket"].to_list() == ["non-simultaneous", "simultaneous", "non-simultaneous"]
+    assert gap_stats(ef)["n"].sum() == 1  # the simultaneous bucket only
 
 
 def test_post_fix_always_uses_last_pre_fix_chain():
@@ -598,3 +616,120 @@ def test_mismatch_tilt_by_role():
     by = {r["expiry_role"]: r for r in t.iter_rows(named=True)}
     assert by["above"]["median_tilt"] == pytest.approx(0.0, abs=1e-12) and by["above"]["n"] == 2
     assert by["below"]["median_tilt"] == pytest.approx(0.06, abs=1e-12) and by["below"]["n"] == 1
+
+
+# --------------------------------------------------------------- pre-merge part 2
+def _fut_row(sid, before, after, flag):
+    r = dict.fromkeys(FUTURES_SCHEMA)
+    r.update(snapshot_id=sid, und_px_before=before, und_px_after=after, df_flag=flag)
+    return r
+
+
+def _moved_tables(strikes, ya_over=None, move=2.0, flag=True, sigma=0.16, ts=None, fut=True):
+    chain = _chain()
+    ts = FIX - 10 * MIN if ts is None else ts
+    lad = [_ladder_row("s0", ts, k, 0.5, 0.52) for k in strikes]
+    opt = _opt_rows("s0", ts, chain, sigma=sigma)
+    futs = [_fut_row("s0", F0, F0 + move, flag)] if fut else []
+    return _tables(lad, opt, futs)
+
+
+def test_w_uses_each_rows_own_strike_delta():
+    from bmm.spotcheck.vol import digital_delta, year_frac
+
+    ks = [6495.0, 6500.0, 6505.0]
+    ef = edge_frame(_moved_tables(ks), 0.01).sort("strike")
+    T = year_frac(FIX - 10 * MIN, FIX)
+    Fm = F0 + 1.0
+    ws = ef["w"].to_list()
+    for k, w in zip(ks, ws, strict=True):
+        assert w == pytest.approx(abs(digital_delta(Fm, k, 0.16, T)) * 2.0, abs=1e-12)
+    assert len({round(w, 9) for w in ws}) == 3  # different strikes, different widening
+    assert ef["dF"].to_list() == [2.0] * 3
+    assert ef["sim_bucket"].to_list() == ["non-simultaneous"] * 3
+
+
+def test_widened_band_contains_the_original_and_is_clipped():
+    ef = edge_frame(_moved_tables([6500.0, 6560.0, 6900.0]), 0.01)
+    for r in ef.iter_rows(named=True):
+        assert r["lower_w"] <= r["lower"] + 1e-15 and r["upper_w"] >= r["upper"] - 1e-15
+        assert 0.0 <= r["lower_w"] <= r["upper_w"] <= 1.0
+        assert r["lower_w"] == pytest.approx(max(r["lower"] - r["w"], 0.0), abs=1e-12)
+        assert r["upper_w"] == pytest.approx(min(r["upper"] + r["w"], 1.0), abs=1e-12)
+
+
+def test_arb_edge_disappears_under_widening():
+    K = 6502.0
+    chain = _chain()
+    ts = FIX - 10 * MIN
+    fb = edges([LadderRow(K, 0.5, 0.52, 40, 40)], chain, 0.01)[0]
+    yb = round(fb.upper + 0.01 + 0.005, 4)  # sells above the upper bound by 0.5c after fee
+    lad = [_ladder_row("s0", ts, K, yb, yb + 0.02)]
+    opt = _opt_rows("s0", ts, chain)
+    still = _tables(lad, opt, [_fut_row("s0", F0, F0, False)])
+    moved = _tables(lad, opt, [_fut_row("s0", F0, F0 + 2.0, True)])
+    e0, e1 = edge_frame(still, 0.01), edge_frame(moved, 0.01)
+    assert e0["arb_sell_edge_w"][0] == pytest.approx(yb - fb.upper - 0.01, abs=1e-12)
+    assert e0["arb_sell_edge_w"][0] > 0
+    assert e1["w"][0] > 0.005 and e1["arb_sell_edge_w"][0] < 0  # the move explains the edge
+    assert arb_table(e0, still).height == 1
+    assert arb_table(e1, moved).height == 0  # no longer counted
+    # unwidened edge is still kept in the frame
+    assert e1["arb_sell_edge"][0] == pytest.approx(e0["arb_sell_edge"][0], abs=1e-12)
+
+
+def test_gap_outside_is_the_gap_beyond_the_widening():
+    ef = edge_frame(_moved_tables([6560.0]), 0.01)
+    r = ef.row(0, named=True)
+    g, w = r["mid_gap"], r["w"]
+    want = (1 if g > 0 else -1) * max(abs(g) - w, 0.0)
+    assert r["gap_outside"] == pytest.approx(want, abs=1e-12)
+    assert abs(r["gap_outside"]) <= abs(g) + 1e-15
+
+
+def test_w_null_when_move_or_sigma_unknown():
+    unknown_after = _tables([_ladder_row("s0", FIX - 10 * MIN, 6560.0, 0.5, 0.52)],
+                            _opt_rows("s0", FIX - 10 * MIN, _chain()),
+                            [_fut_row("s0", F0, None, None)])  # fmt: skip
+    r = edge_frame(unknown_after, 0.01).row(0, named=True)
+    assert r["w"] is None and r["dF"] is None and r["gap_outside"] is None
+    assert r["sim_bucket"] == "non-simultaneous"
+    assert r["lower_w"] == r["lower"] and r["upper_w"] == r["upper"]
+    assert arb_table(edge_frame(unknown_after, 0.01), unknown_after).height in (0, 1)
+    nosig = _moved_tables([6560.0], sigma=None)
+    assert edge_frame(nosig, 0.01)["w"][0] is None  # no sigma, no memo yet
+
+
+def test_sigma_memo_used_when_snapshot_sigma_missing():
+    chain = _chain()
+    t0, t1 = FIX - 12 * MIN, FIX - 10 * MIN
+    lad = [_ladder_row("s0", t0, 6560.0, 0.5, 0.52), _ladder_row("s1", t1, 6560.0, 0.5, 0.52)]
+    opt = _opt_rows("s0", t0, chain, sigma=0.16) + _opt_rows("s1", t1, chain, sigma=None)
+    futs = [_fut_row("s0", F0, F0, False), _fut_row("s1", F0, F0 + 1.0, True)]
+    ef = edge_frame(_tables(lad, opt, futs), 0.01).sort("ts_ns")
+    assert ef["w"][1] is not None and ef["w"][1] > 0
+
+
+def test_missing_futures_row_means_simultaneous_with_zero_move():
+    ef = edge_frame(_moved_tables([6560.0], fut=False), 0.01)
+    assert ef["sim_bucket"][0] == "simultaneous" and ef["dF"][0] == 0.0 and ef["w"][0] == 0.0
+
+
+def test_gap_stats_buckets_and_adjusted():
+    ef = _ef([
+        {"gap": 4, "i": 0},
+        {"gap": 6, "i": 1, "df_flag": True, "w": 0.05, "gap_outside": 0.01},
+        {"gap": 6, "i": 2, "df_flag": True, "w": None, "gap_outside": None},
+    ])  # fmt: skip
+    assert gap_stats(ef)["n"][0] == 1
+    ns = gap_stats(ef, sim="non-simultaneous")
+    assert ns["n"][0] == 2 and ns["median_abs_gap"][0] == pytest.approx(0.06, abs=1e-12)
+    out = gap_stats(ef, sim="non-simultaneous", value="gap_outside")
+    assert out["n"][0] == 1 and out["median_abs_gap"][0] == pytest.approx(0.01, abs=1e-12)
+    adj = gap_stats(ef, sim="adjusted")  # 4c (sim) + 1c (outside); the null-w row is dropped
+    assert adj["n"][0] == 2 and adj["median_abs_gap"][0] == pytest.approx(0.025, abs=1e-12)
+    ex = metrics.nonsim_extra(ef).row(0, named=True)
+    assert ex["n_w_null"] == 1 and ex["median_w"] == pytest.approx(0.05, abs=1e-12)
+    c = metrics.sim_counts(ef)
+    assert dict(zip(c["sim_bucket"], c["snapshots"], strict=True)) == {
+        "non-simultaneous": 2, "simultaneous": 1}  # fmt: skip

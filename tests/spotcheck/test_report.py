@@ -84,11 +84,26 @@ def test_mismatch_section_flags_cme_gold(report):
     assert "100%" in s7
 
 
-def test_section_2_states_excluded_df_flag_snapshots(report):
-    sec = _sections(report[0].read_text())["forecastex-spx"]
-    s2 = sec.split("### 2. Mid gap vs fair")[1].split("### 3.")[0]
-    assert "0 of 66 pre-fix snapshots excluded" in s2
-    assert "df_flag" in s2
+def test_section_2_has_both_simultaneity_buckets(report):
+    for p in ("forecastex-spx", "forecastex-ndx", "forecastex-gold"):
+        sec = _sections(report[0].read_text())[p]
+        s2 = sec.split("### 2. Mid gap vs fair")[1].split("### 3.")[0]
+        assert "**simultaneous**" in s2 and "**non-simultaneous**" in s2
+        assert "**Simultaneous bucket**" in s2 and "**Non-simultaneous bucket**" in s2
+        assert "gap outside the widened band" in s2 and "median w (c)" in s2
+        m = re.search(r"(\d+) simultaneous \((\d+) rows\), (\d+) non-simultaneous", s2)
+        assert m and int(m.group(1)) > 0 and int(m.group(3)) > 0, (p, s2[:900])
+        s3 = sec.split("### 3. Taker edge after fees")[1].split("### 4.")[0]
+        assert "Non-simultaneous bucket" in s3
+        s5 = sec.split("### 5. Persistence")[1].split("### 6.")[0]
+        assert "Non-simultaneous bucket" in s5
+
+
+def test_summary_carries_info_verdict_with_nonsimultaneous(report):
+    summary = report[0].read_text().split("## Summary")[1]
+    for p in PRODUCTS:
+        line = next(ln for ln in summary.splitlines() if ln.startswith(f"- {p}:"))
+        assert "with non-simultaneous rows included: " in line
 
 
 def test_section_4_has_dollar_totals_and_scale_note(report):
