@@ -364,3 +364,81 @@ def test_ladder_has_post_fix_flag_and_none_for_missing_raw_sizes(tmp_path):
     assert lad.filter(pl.col("raw_no_ask").is_null())["raw_no_ask_size"].null_count() == (
         lad.filter(pl.col("raw_no_ask").is_null()).height
     )
+
+
+# --- quant-review 11-13 nits ---------------------------------------------------------------------
+def test_df_flag_delta_uses_time_to_fix_not_to_expiry(tmp_path):
+    """cme-gold's chain expires 24 h after the fix; the delta must use T to the fix (~0.4/pt
+    near the fix), so a 0.2 pt move flags where T-to-expiry (~0.01/pt) would not."""
+    _, status = go(lambda s: MovingFuture(s, 0.2), products=[PRODUCTS["cme-gold"]], tmp=tmp_path)
+    assert status == {"cme-gold": "ok"}
+    fut = _read(tmp_path, "futures")
+    fix = ct(12, 30)
+    near = fut.filter(pl.col("ts_ns").is_between(fix - 10 * 60 * 10**9, fix - 60 * 10**9))
+    assert near.height > 5 and near["df_flag"].all()
+
+
+def test_post_fix_snapshots_are_not_flagged(tmp_path):
+    _, _ = go(lambda s: MovingFuture(s, 5.0), products=[PRODUCTS["cme-gold"]], tmp=tmp_path)
+    fut = _read(tmp_path, "futures")
+    assert not fut.filter(pl.col("ts_ns") >= FIX)["df_flag"].any()
+
+
+class NoSigma:
+    """ATM quotes have bid 0 for the first `n_bad` snapshots, so atm_sigma cannot resolve."""
+
+    def __init__(self, inner, n_bad_after=None):
+        self.inner, self.bad_from = inner, n_bad_after
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    async def calls(self, spec, expiry, strikes):
+        from bmm.spotcheck.source import SizedOptQuote
+
+        out = await self.inner.calls(spec, expiry, strikes)
+        if self.bad_from is None or self.inner._clock() >= self.bad_from:
+            return [SizedOptQuote(q.strike, 0.0, q.call_ask) for q in out]  # bid 0: unusable IV
+        return out
+
+
+def test_df_flag_null_when_sigma_never_resolved(tmp_path):
+    _, status = go(lambda s: NoSigma(s), products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)
+    assert status == {"forecastex-spx": "ok"}
+    fut = _read(tmp_path, "futures")
+    pre = fut.filter(pl.col("ts_ns") < FIX)
+    assert pre["df_flag"].null_count() == pre.height  # unknown, not False
+
+
+def test_df_flag_uses_last_resolved_sigma_when_snapshot_sigma_missing(tmp_path):
+    bad_from = ct(14, 0)
+    _, status = go(lambda s: MovingFuture(NoSigma(s, bad_from), 0.2),
+                   products=[PRODUCTS["forecastex-spx"]], tmp=tmp_path)  # fmt: skip
+    assert status == {"forecastex-spx": "ok"}
+    fut = _read(tmp_path, "futures")
+    late = fut.filter(pl.col("ts_ns").is_between(bad_from, FIX - 5 * 60 * 10**9))
+    assert late.height > 20
+    assert late["df_flag"].null_count() == 0  # the memoised sigma sized the move
+    near = late.filter(pl.col("ts_ns") >= FIX - 10 * 60 * 10**9)  # delta ~0.09/pt: 0.2 pt > 1c
+    assert near.height >= 5 and near["df_flag"].all()
+    assert not late.filter(pl.col("ts_ns") <= ct(14, 5))["df_flag"].any()  # ~0.02/pt: not flagged
+
+
+def test_late_future_quote_flags_the_snapshot(tmp_path):
+    class SlowFut:
+        def __init__(self, inner, vc):
+            self.inner, self.vc = inner, vc
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        async def reference_future(self, *a):
+            self.vc.t += 6 * 10**9  # > 5 s after the ladder
+            return await self.inner.reference_future(*a)
+
+    vc = VClock(ct(11, 30))
+    inner = FixtureSource.from_json(SESSION, clock=vc)
+    asyncio.run(collect(SlowFut(inner, vc), [PRODUCTS["forecastex-spx"]], D,
+                        ParquetSink(tmp_path), vc, vc.sleep))  # fmt: skip
+    fut = _read(tmp_path, "futures")
+    assert fut.filter(pl.col("ts_ns") < FIX)["df_flag"].all()

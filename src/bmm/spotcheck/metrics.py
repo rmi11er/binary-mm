@@ -45,7 +45,8 @@ EF_SCHEMA: dict[str, Any] = {
     "F": pl.Float64, "sigma": pl.Float64, "T": pl.Float64, "m_bucket": pl.String,
     "ttf_bucket": pl.String, "expiry_mismatch": pl.Boolean, "crossed": pl.Boolean,
     "stale_chain": pl.Boolean, "df_flag": pl.Boolean, "opt_snapshot_id": pl.String, "opt_ts_ns": pl.Int64,
-    "opt_expiry_ts_ns": pl.Int64,
+    "opt_expiry_ts_ns": pl.Int64, "ladder_ts_ns": pl.Int64, "payout_scale": pl.Float64,
+    "expiry_role": pl.String,
 }  # fmt: skip
 
 
@@ -97,6 +98,8 @@ class _Chain:
     quotes: list[OptQuote]
     F: float
     sigma: float | None
+    role: str = "match"
+    opt_ts_ns: int = 0  # when the option fetch completed (falls back to the slot ts)
 
 
 def _select_chains(options: pl.DataFrame, fix_of: dict[str, int]) -> dict[str, _Chain]:
@@ -119,7 +122,8 @@ def _select_chains(options: pl.DataFrame, fix_of: dict[str, int]) -> dict[str, _
         out[sid] = _Chain(
             sid, r0["ts_ns"], key[0], bool(r0["expiry_mismatch"]) or key[1] != "match",
             [OptQuote(r["strike"], r["call_bid"], r["call_ask"]) for r in rows],
-            r0["und_px"], r0["atm_sigma"],
+            r0["und_px"], r0["atm_sigma"], key[1],
+            r0["opt_ts_ns"] if r0.get("opt_ts_ns") is not None else r0["ts_ns"],
         )  # fmt: skip
     return out
 
@@ -130,8 +134,9 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
     fix_of = {r["snapshot_id"]: r["fix_ts_ns"] for r in snaps.iter_rows(named=True)}
     chains = _select_chains(tables["options"], fix_of)
     fut = tables["futures"]
+    # null df_flag = unknown = flagged; a snapshot with no futures row is not flagged
     flagged = (
-        {r["snapshot_id"] for r in fut.filter(pl.col("df_flag")).iter_rows(named=True)}
+        {r["snapshot_id"] for r in fut.iter_rows(named=True) if r["df_flag"] is not False}
         if "df_flag" in fut.columns else set()
     )  # fmt: skip
     by_snap = {k[0]: g for k, g in lad.partition_by("snapshot_id", as_dict=True).items()}
@@ -151,8 +156,8 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
             if ref is None:
                 continue
             ref_ch, ref_T = ref
-            stale = ch is None
-            ch = ref_ch if ch is None else ch
+            stale = True  # post-fix: fair always from the last pre-fix chain
+            ch = ref_ch
         rows = by_snap[sid].sort("strike").iter_rows(named=True)
         lrows = list(rows)
         ladder = [
@@ -173,8 +178,11 @@ def edge_frame(tables: dict[str, pl.DataFrame], fee_per_side: float) -> pl.DataF
                 "m_bucket": moneyness_bucket(e.strike, ref_ch.F, ref_ch.sigma, ref_T),
                 "ttf_bucket": ttf_bucket(ts, fix), "expiry_mismatch": ch.mismatch,
                 "crossed": bool(lr["crossed"]), "stale_chain": stale, "df_flag": sid in flagged,
-                "opt_snapshot_id": ch.snapshot_id, "opt_ts_ns": ch.ts_ns,
+                "opt_snapshot_id": ch.snapshot_id, "opt_ts_ns": ch.opt_ts_ns,
                 "opt_expiry_ts_ns": ch.expiry_ts_ns,
+                "ladder_ts_ns": lr["ladder_ts_ns"] if lr["ladder_ts_ns"] is not None else ts,
+                "payout_scale": lr["payout_scale"] if lr["payout_scale"] is not None else 1.0,
+                "expiry_role": ch.role,
             })  # fmt: skip
     return pl.DataFrame(out, schema=EF_SCHEMA)
 
@@ -197,7 +205,9 @@ def _order(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataFrame:
-    """Per product x `by`: n, median_abs_gap, iqr, pct_gt_2c, pct_gt_3c (all on |gap|).
+    """Per product x `by`: n, median_abs_gap, iqr, pct_gt_2c, pct_gt_3c (per observation, i.e. per
+    strike-snapshot, on |gap|) and pct_snapshots_gt_2c/3c (share of snapshots whose median |gap|
+    over the group exceeds the threshold). The rule uses the per-observation columns.
 
     Crossed rows are always excluded. Post-fix rows are excluded unless "ttf_bucket" is in `by`.
     """
@@ -212,7 +222,14 @@ def gap_stats(ef: pl.DataFrame, by: tuple[str, ...] = ("m_bucket",)) -> pl.DataF
         pct_gt_2c=(pl.col("g") > 0.02 + EPS).mean(),
         pct_gt_3c=(pl.col("g") > 0.03 + EPS).mean(),
     )
-    return _order(res)
+    # per snapshot: share of snapshots whose median |gap| over the group's strikes exceeds thr
+    snap = d.group_by("product", "snapshot_id", *by).agg(m=pl.col("g").median())
+    ps = snap.group_by("product", *by).agg(
+        n_snapshots=pl.len(),
+        pct_snapshots_gt_2c=(pl.col("m") > 0.02 + EPS).mean(),
+        pct_snapshots_gt_3c=(pl.col("m") > 0.03 + EPS).mean(),
+    )
+    return _order(res.join(ps, on=["product", *by], how="left"))
 
 
 def size_at_gap_strikes(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
@@ -241,11 +258,33 @@ def taker_stats(ef: pl.DataFrame, fees: tuple[float, ...] = (0.01, 0.02)) -> pl.
         x = d.with_columns(b=pl.col("take_buy_edge") - shift, s=pl.col("take_sell_edge") - shift)
         x = x.with_columns(
             best=pl.max_horizontal("b", "s"),
-            cap=pl.when(pl.col("b") > 0).then(pl.col("b") * pl.col("ask_size")).otherwise(0.0)
-            + pl.when(pl.col("s") > 0).then(pl.col("s") * pl.col("bid_size")).otherwise(0.0),
+            cap=(
+                pl.when(pl.col("b") > 0).then(pl.col("b") * pl.col("ask_size")).otherwise(0.0)
+                + pl.when(pl.col("s") > 0).then(pl.col("s") * pl.col("bid_size")).otherwise(0.0)
+            )
+            * pl.col("payout_scale"),  # edges are per $1 of payout; scale to $ per contract
+            cap1=(
+                pl.when(pl.col("b") > 0.01 + EPS)
+                .then(pl.col("b") * pl.col("ask_size"))
+                .otherwise(0.0)
+                + pl.when(pl.col("s") > 0.01 + EPS)
+                .then(pl.col("s") * pl.col("bid_size"))
+                .otherwise(0.0)
+            )
+            * pl.col("payout_scale"),
+            cap2=(
+                pl.when(pl.col("b") > 0.02 + EPS)
+                .then(pl.col("b") * pl.col("ask_size"))
+                .otherwise(0.0)
+                + pl.when(pl.col("s") > 0.02 + EPS)
+                .then(pl.col("s") * pl.col("bid_size"))
+                .otherwise(0.0)
+            )
+            * pl.col("payout_scale"),
         )
         per = x.group_by("product", "snapshot_id").agg(
-            best=pl.col("best").max(), cap=pl.col("cap").sum()
+            best=pl.col("best").max(), cap=pl.col("cap").sum(),
+            cap1=pl.col("cap1").sum(), cap2=pl.col("cap2").sum()
         ).filter(pl.col("best").is_not_null())  # fmt: skip
         for (product,), g in per.group_by("product"):
             rows.append({
@@ -255,63 +294,69 @@ def taker_stats(ef: pl.DataFrame, fees: tuple[float, ...] = (0.01, 0.02)) -> pl.
                 "pct_snapshots_best_edge_le_0": _f((g["best"] <= EPS).mean()),
                 "capturable_median": _f(g["cap"].median()),
                 "capturable_p90": _f(g["cap"].quantile(0.9, "linear")),
+                "capturable_gt_1c_median": _f(g["cap1"].median()),
+                "capturable_gt_2c_median": _f(g["cap2"].median()),
             })  # fmt: skip
     schema = {
         "product": pl.String, "fee": pl.Float64, "n_snapshots": pl.Int64,
         "pct_snapshots_best_edge_gt_1c": pl.Float64, "pct_snapshots_best_edge_gt_2c": pl.Float64,
         "pct_snapshots_best_edge_le_0": pl.Float64, "capturable_median": pl.Float64,
-        "capturable_p90": pl.Float64,
+        "capturable_p90": pl.Float64, "capturable_gt_1c_median": pl.Float64,
+        "capturable_gt_2c_median": pl.Float64,
     }  # fmt: skip
     return pl.DataFrame(rows, schema=schema).sort("product", "fee")
 
 
-def persistence(ef: pl.DataFrame, thr: float = 0.03) -> pl.DataFrame:
-    """Runs of consecutive snapshots with |gap| > thr, per (product, strike).
+def persistence(
+    ef: pl.DataFrame, thr: float = 0.03, grid: pl.DataFrame | None = None
+) -> pl.DataFrame:
+    """Runs of consecutive snapshots with |gap| > thr, per (product, fix, strike).
 
-    "Consecutive" = adjacent snapshot ordinals within the product; a missing row, a crossed row
-    or |gap| <= thr breaks the run. A run is attributed to the moneyness bucket of its first
+    `grid` (product, fix_ts_ns, ts_ns: every collected snapshot, e.g. the ladder table) defines
+    the snapshot ordinals within each (product, fix). Runs never cross sessions, and any snapshot
+    missing from `ef` (dropped, filtered out as mismatched, no chain) breaks a run because its
+    ordinal is skipped. Without `grid`, ordinals come from `ef` itself. A crossed or df_flag row,
+    or |gap| <= thr, also breaks a run. A run is attributed to the moneyness bucket of its first
     snapshot. Only pre-fix rows are used.
     """
     d = ef.filter(pl.col("ttf_bucket") != "post-fix")
+    src = grid if grid is not None else ef
+    ordinal: dict[tuple[str, int, int], int] = {}
+    for (prod, fix), g in src.group_by("product", "fix_ts_ns"):
+        for i, t in enumerate(sorted(g["ts_ns"].unique().to_list())):
+            ordinal[(str(prod), int(fix), int(t))] = i
     runs: dict[tuple[str, str], list[int]] = defaultdict(list)
-    for pkey, g in d.group_by("product"):
-        pname = str(pkey[0])
-        ordinal = {t: i for i, t in enumerate(sorted(g["ts_ns"].unique().to_list()))}
-        by_strike: dict[float, list[dict[str, Any]]] = defaultdict(list)
-        for r in g.sort("ts_ns").iter_rows(named=True):
-            by_strike[r["strike"]].append(r)
-        for rows in by_strike.values():
-            cur = 0
-            first_bucket = ""
-            prev = -10
-            for r in rows:
-                o = ordinal[r["ts_ns"]]
-                hit = (
-                    (not r["crossed"])
-                    and (not r["df_flag"])
-                    and r["mid_gap"] is not None
-                    and abs(r["mid_gap"]) > thr + EPS
-                )
-                if hit and cur and o == prev + 1:
-                    cur += 1
-                elif hit:
-                    if cur:
-                        runs[(pname, first_bucket)].append(cur)
+    by_key: dict[tuple[str, int, float], list[dict[str, Any]]] = defaultdict(list)
+    for r in d.sort("ts_ns").iter_rows(named=True):
+        by_key[(r["product"], r["fix_ts_ns"], r["strike"])].append(r)
+    for (pname, fix, _k), rows in by_key.items():
+        cur, first_bucket, prev = 0, "", -10
+        for r in rows:
+            o = ordinal[(pname, fix, r["ts_ns"])]
+            hit = (
+                (not r["crossed"])
+                and (not r["df_flag"])
+                and r["mid_gap"] is not None
+                and abs(r["mid_gap"]) > thr + EPS
+            )
+            if hit and cur and o == prev + 1:
+                cur += 1
+            else:
+                if cur:
+                    runs[(pname, first_bucket)].append(cur)
+                cur = 0
+                if hit:
                     cur, first_bucket = 1, r["m_bucket"]
-                else:
-                    if cur:
-                        runs[(pname, first_bucket)].append(cur)
-                    cur = 0
-                prev = o
-            if cur:
-                runs[(pname, first_bucket)].append(cur)
+            prev = o
+        if cur:
+            runs[(pname, first_bucket)].append(cur)
     out = []
     for (product, bucket), rl in sorted(runs.items()):
-        s = sorted(rl)
-        mid = len(s) // 2
-        med = float(s[mid]) if len(s) % 2 else 0.5 * (s[mid - 1] + s[mid])
-        out.append({"product": product, "m_bucket": bucket, "n_runs": len(s),
-                    "median_run": med, "max_run": max(s)})  # fmt: skip
+        sr = sorted(rl)
+        mid = len(sr) // 2
+        med = float(sr[mid]) if len(sr) % 2 else 0.5 * (sr[mid - 1] + sr[mid])
+        out.append({"product": product, "m_bucket": bucket, "n_runs": len(sr),
+                    "median_run": med, "max_run": max(sr)})  # fmt: skip
     schema = {"product": pl.String, "m_bucket": pl.String, "n_runs": pl.Int64,
               "median_run": pl.Float64, "max_run": pl.Int64}  # fmt: skip
     return pl.DataFrame(out, schema=schema)
@@ -328,8 +373,10 @@ def _opt_widths(options: pl.DataFrame) -> dict[tuple[str, int], list[tuple[float
 
 def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
     """Rows with a positive model-free edge. opt_rel_width = widest (ask-bid)/mid among the (up to
-    four) option strikes nearest the venue strike; suspect if > 0.5 or the option quote is more
-    than 5 s older than the ladder."""
+    four) option strikes nearest the venue strike. opt_ts_lag_ms = |ladder fetch time - option
+    fetch time|. suspect if width > 0.5, lag > 5 s, or the row is post-fix, df_flag or on a stale
+    (carried) chain. arb_usd = positive edge x displayed taker-side size x payout_scale.
+    Rows are labelled (post_fix, df_flag), not dropped."""
     d = ef.filter(
         ~pl.col("crossed") & ((pl.col("arb_buy_edge") > 0) | (pl.col("arb_sell_edge") > 0))
     )
@@ -341,19 +388,28 @@ def arb_table(ef: pl.DataFrame, tables: dict[str, pl.DataFrame]) -> pl.DataFrame
         above = [x for x in q if x[0] >= r["strike"]][:2]
         w = [(a - b) / max(0.5 * (a + b), 1e-9) for _k, b, a in below + above]
         rel = max(w) if w else float("inf")
-        lag = (r["ts_ns"] - r["opt_ts_ns"]) / 1e6
+        lag = abs(r["ladder_ts_ns"] - r["opt_ts_ns"]) / 1e6
+        post = r["ttf_bucket"] == "post-fix"
+        buy, sell = r["arb_buy_edge"], r["arb_sell_edge"]
+        usd = (max(buy or 0.0, 0.0) * r["ask_size"] + max(sell or 0.0, 0.0) * r["bid_size"]) * r[
+            "payout_scale"
+        ]
         rows.append({
             "product": r["product"], "snapshot_id": r["snapshot_id"], "ts_ns": r["ts_ns"],
             "strike": r["strike"], "yes_bid": r["yes_bid"], "yes_ask": r["yes_ask"],
             "arb_buy_edge": r["arb_buy_edge"], "arb_sell_edge": r["arb_sell_edge"],
+            "bid_size": r["bid_size"], "ask_size": r["ask_size"], "arb_usd": usd,
+            "post_fix": post, "df_flag": r["df_flag"],
             "opt_ts_lag_ms": lag, "opt_rel_width": rel,
-            "suspect": rel > SUSPECT_REL_WIDTH or lag > SUSPECT_LAG_MS,
+            "suspect": rel > SUSPECT_REL_WIDTH or lag > SUSPECT_LAG_MS or post
+            or bool(r["df_flag"]) or bool(r["stale_chain"]),
         })  # fmt: skip
     schema = {
         "product": pl.String, "snapshot_id": pl.String, "ts_ns": pl.Int64, "strike": pl.Float64,
         "yes_bid": pl.Float64, "yes_ask": pl.Float64, "arb_buy_edge": pl.Float64,
-        "arb_sell_edge": pl.Float64, "opt_ts_lag_ms": pl.Float64, "opt_rel_width": pl.Float64,
-        "suspect": pl.Boolean,
+        "arb_sell_edge": pl.Float64, "bid_size": pl.Int64, "ask_size": pl.Int64,
+        "arb_usd": pl.Float64, "post_fix": pl.Boolean, "df_flag": pl.Boolean,
+        "opt_ts_lag_ms": pl.Float64, "opt_rel_width": pl.Float64, "suspect": pl.Boolean,
     }  # fmt: skip
     return pl.DataFrame(rows, schema=schema)
 
@@ -448,3 +504,32 @@ def mismatch_share(ef: pl.DataFrame) -> pl.DataFrame:
     return out.with_columns(
         bias_abs=pl.col("median_abs_gap_mismatched") - pl.col("median_abs_gap_matched")
     ).sort("product")
+
+
+def arb_totals(arb: pl.DataFrame) -> pl.DataFrame:
+    """Per product x suspect: rows, snapshots and total arb $ (edge x size x payout_scale)."""
+    return (
+        arb.group_by("product", "suspect")
+        .agg(
+            rows=pl.len(),
+            snapshots=pl.col("snapshot_id").n_unique(),
+            arb_usd=pl.col("arb_usd").sum(),
+        )
+        .sort("product", "suspect")
+    )
+
+
+def mismatch_tilt(ef: pl.DataFrame) -> pl.DataFrame:
+    """Bias direction per chain role: median of gap x sign(F - K), i.e. venue mid minus fair
+    signed so that a positive value means the venue is rich on the ITM digital / cheap on the OTM
+    one relative to that chain. Compare roles: a chain from a later expiry ("above") and an
+    earlier one ("below") should tilt opposite ways if the mismatch drives the gap."""
+    d = _headline(ef).filter(pl.col("mid_gap").is_not_null() & (pl.col("F") != pl.col("strike")))
+    d = d.with_columns(
+        tilt=pl.col("mid_gap") * pl.when(pl.col("F") > pl.col("strike")).then(1.0).otherwise(-1.0)
+    )
+    return (
+        d.group_by("product", "expiry_role")
+        .agg(n=pl.len(), median_tilt=pl.col("tilt").median())
+        .sort("product", "expiry_role")
+    )

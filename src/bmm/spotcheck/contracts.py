@@ -69,7 +69,8 @@ def option_class_ok(spec: ProductSpec, trading_class: str) -> bool:
         return False
     if tc.upper().startswith("EC"):
         return False
-    return not spec.opt_trading_classes or tc in spec.opt_trading_classes
+    allow = {c.strip().upper() for c in spec.opt_trading_classes}
+    return not allow or tc.upper() in allow
 
 
 def load_products(path: Path | None) -> dict[str, ProductSpec]:

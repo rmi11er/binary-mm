@@ -89,3 +89,23 @@ def test_section_2_states_excluded_df_flag_snapshots(report):
     s2 = sec.split("### 2. Mid gap vs fair")[1].split("### 3.")[0]
     assert "0 of 66 pre-fix snapshots excluded" in s2
     assert "df_flag" in s2
+
+
+def test_section_4_has_dollar_totals_and_scale_note(report):
+    md = report[0].read_text()
+    for p in PRODUCTS:
+        s4 = _sections(md)[p].split("### 4. Model-free arb edges")[1].split("### 5.")[0]
+        assert "No venue quote beat" in s4 or ("arb $" in s4 and "payout scale" in s4)
+
+
+def test_section_2_and_3_state_per_snapshot_and_threshold_columns(report):
+    sec = _sections(report[0].read_text())["forecastex-spx"]
+    s2 = sec.split("### 2. Mid gap vs fair")[1].split("### 3.")[0]
+    assert "% snaps" in s2 and "% obs" in s2
+    s3 = sec.split("### 3. Taker edge after fees")[1].split("### 4.")[0]
+    assert "edge > 1c" in s3 and "edge > 2c" in s3 and "payout scale" in s3
+
+
+def test_section_7_has_tilt_by_role(report):
+    s7 = _sections(report[0].read_text())["cme-gold"].split("### 7. Expiry mismatch")[1]
+    assert "Tilt by chain role" in s7 and "above" in s7.split("Tilt by chain role")[1]

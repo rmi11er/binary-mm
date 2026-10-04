@@ -12,6 +12,8 @@ from typing import Literal
 
 import polars as pl
 
+from bmm.spotcheck.metrics import MONEYNESS_BUCKETS
+
 # OWNER-OWNED (docs/spotcheck_spec.md "Decision rule"). Agents must not change these values.
 GO_MEDIAN_ABS_GAP = 0.03
 GO_PCT_GT_3C = 0.30
@@ -48,7 +50,7 @@ def _buckets(
         return {r["m_bucket"]: r[col] for r in d.iter_rows(named=True)}
 
     run, size = pick(pers, "median_run"), pick(sizes, "median_size")
-    g = gaps.filter(pl.col("product") == product)
+    g = gaps.filter((pl.col("product") == product) & pl.col("m_bucket").is_in(MONEYNESS_BUCKETS))
     return {
         r["m_bucket"]: _Bucket(r["median_abs_gap"], r["pct_gt_3c"], run.get(r["m_bucket"]),
                                size.get(r["m_bucket"]))

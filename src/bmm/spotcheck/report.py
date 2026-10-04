@@ -201,7 +201,9 @@ def write_report(
     gap_all, gap_m = metrics.gap_stats(efv), metrics.gap_stats(efm)
     gap_ttf = metrics.gap_stats(efv, by=("ttf_bucket",))
     taker = metrics.taker_stats(efv, FEES)
-    pers_all, pers_m = metrics.persistence(efv), metrics.persistence(efm)
+    grid = tables["ladder"].select("product", "fix_ts_ns", "ts_ns").unique()  # every snapshot
+    pers_all = metrics.persistence(efv, grid=grid)
+    pers_m = metrics.persistence(efm, grid=grid)  # mismatched snapshots break matched runs
     persist = pl.concat([_with_scope(pers_all, "all"), _with_scope(pers_m, "matched")])
     sz_all, sz_m = metrics.size_at_gap_strikes(efv), metrics.size_at_gap_strikes(efm)
     sizes = pl.concat([_with_scope(sz_all, "all"), _with_scope(sz_m, "matched")])
@@ -209,6 +211,8 @@ def write_report(
     pfa = metrics.post_fix_activity(tables, efv)
     mism = metrics.mismatch_share(efv)
     arb = metrics.arb_table(efv, tables)
+    arb_tot = metrics.arb_totals(arb)
+    tilt = metrics.mismatch_tilt(efv)
 
     out: list[str] = [
         f"# Spot check report: {label}",
@@ -234,9 +238,17 @@ def write_report(
         ppng = out_dir / f"spotcheck_{label}_{p}_persistence.png"
         _gap_chart(pf(gap_all), p, gpng)
         _persist_chart(pf(pers_all), p, ppng)
-        gfmt = {"median_abs_gap": _c, "iqr": _c, "pct_gt_2c": _pct, "pct_gt_3c": _pct}
-        gren = {"median_abs_gap": "median abs gap (c)", "iqr": "IQR (c)", "pct_gt_2c": "> 2c",
-                "pct_gt_3c": "> 3c"}  # fmt: skip
+        gfmt = {
+            "median_abs_gap": _c,
+            "iqr": _c,
+            "pct_gt_2c": _pct,
+            "pct_gt_3c": _pct,
+            "pct_snapshots_gt_2c": _pct,
+            "pct_snapshots_gt_3c": _pct,
+        }
+        gren = {"median_abs_gap": "median abs gap (c)", "iqr": "IQR (c)", "pct_gt_2c": "> 2c (% obs)",
+                "pct_gt_3c": "> 3c (% obs)",
+                "pct_snapshots_gt_2c": "> 2c (% snaps)", "pct_snapshots_gt_3c": "> 3c (% snaps)"}  # fmt: skip
         out += [f"## {p}", "", "### 1. Ladder quality", "", _section_ladder(lq, p)]
         out += [
             "### 2. Mid gap vs fair", "",
@@ -245,7 +257,9 @@ def write_report(
             "fetch by enough to shift the digital by more than 1c). F is the mean of the "
             "before/after future quotes.", "",
             "By moneyness bucket (all pre-fix, non-crossed observations, expiry-mismatched "
-            "chains included):", "",
+            "chains included). `% obs` = share of strike-snapshot observations with |gap| above "
+            "the threshold (what the owner rule uses); `% snaps` = share of snapshots whose "
+            "median |gap| in the bucket exceeds it:", "",
             _md(_order_buckets(pf(gap_all), "m_bucket", metrics.MONEYNESS_BUCKETS), gfmt, gren),
             "By time to fix (post-fix shown for information only):", "",
             _md(_order_buckets(pf(gap_ttf), "ttf_bucket", metrics.TTF_BUCKETS), gfmt, gren),
@@ -255,15 +269,20 @@ def write_report(
         out += [
             "### 3. Taker edge after fees", "",
             "Best edge per snapshot = max over strikes of buy (fair - ask - fee) and sell "
-            "(bid - fair - fee). Capturable = positive edge x displayed taker-side size, $ per "
-            "snapshot.", "",
+            "(bid - fair - fee). Capturable = sum of positive edge x displayed taker-side size x "
+            "payout scale, $ per snapshot, at edge threshold 0 (and above 1c and 2c, medians), "
+            "at fee 0.01 and 0.02.", "",
             _md(tk, {"fee": lambda x: f"{x:.2f}", "pct_snapshots_best_edge_gt_1c": _pct,
                      "pct_snapshots_best_edge_gt_2c": _pct, "pct_snapshots_best_edge_le_0": _pct,
                      "capturable_median": lambda x: f"{x:.2f}",
-                     "capturable_p90": lambda x: f"{x:.2f}"},
+                     "capturable_p90": lambda x: f"{x:.2f}",
+                     "capturable_gt_1c_median": lambda x: f"{x:.2f}",
+                     "capturable_gt_2c_median": lambda x: f"{x:.2f}"},
                 {"pct_snapshots_best_edge_gt_1c": "best > 1c", "pct_snapshots_best_edge_gt_2c":
                  "best > 2c", "pct_snapshots_best_edge_le_0": "best <= 0",
                  "capturable_median": "capturable median ($)", "capturable_p90": "capturable p90 ($)",
+                 "capturable_gt_1c_median": "cap. median, edge > 1c ($)",
+                 "capturable_gt_2c_median": "cap. median, edge > 2c ($)",
                  "fee": "fee/side"}),
         ]  # fmt: skip
         a = pf(arb)
@@ -274,10 +293,13 @@ def write_report(
         else:
             out += [
                 f"{a.height} rows beat the bounds after fee {rule.VERDICT_FEE:g} "
-                f"({int(a['suspect'].sum())} suspect: option width > 50% of mid or option quote "
-                "more than 5 s older than the ladder).", "",
+                f"({int(a['suspect'].sum())} suspect: option width > 50% of mid, option fetch more "
+                "than 5 s from the ladder fetch, post-fix, df_flag or carried chain). "
+                "$ = positive edge x displayed taker-side size x payout scale.", "",
+                _md(pf(arb_tot), {"arb_usd": lambda x: f"{x:.2f}"},
+                    {"arb_usd": "arb $ (edge x size)"}),
                 _md(a.drop("snapshot_id").head(25),
-                    {"ts_ns": _n, "arb_buy_edge": _c, "arb_sell_edge": _c, "yes_bid": _f4,
+                    {"ts_ns": _n, "arb_usd": lambda x: f"{x:.2f}", "arb_buy_edge": _c, "arb_sell_edge": _c, "yes_bid": _f4,
                      "yes_ask": _f4, "opt_ts_lag_ms": lambda x: f"{x:.0f}",
                      "opt_rel_width": lambda x: f"{x:.3f}"}),
             ]  # fmt: skip
@@ -300,7 +322,10 @@ def write_report(
                 "larger gaps).", "",
                 _md(pf(mism), {"share_mismatched": _pct, "median_gap_matched": _c,
                                "median_gap_mismatched": _c, "median_abs_gap_matched": _c,
-                               "median_abs_gap_mismatched": _c, "bias_abs": _c})]  # fmt: skip
+                               "median_abs_gap_mismatched": _c, "bias_abs": _c}),
+                "Tilt by chain role = median of (mid - fair) x sign(F - K) in cents; compare the "
+                "`below` and `above` roles:", "",
+                _md(pf(tilt), {"median_tilt": _c})]  # fmt: skip
         nums = pl.DataFrame({"quantity": list(v.numbers), "value": list(v.numbers.values())})
         out += [
             "### 8. Verdict", "",

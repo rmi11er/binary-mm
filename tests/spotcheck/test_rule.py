@@ -214,3 +214,14 @@ def test_no_data_is_not_kill():
     v = verdict("x", gaps({}), gaps({}), pers({}), sizes({}), taker(0.99))
     assert v.label == "INVESTIGATE"
     assert any("no data" in r for r in v.reasons)
+
+
+def test_na_bucket_is_not_a_rule_bucket():
+    """Unresolved-sigma rows land in 'n/a'; they must neither earn a GO nor block a KILL."""
+    na_go = {"n/a": (0.09, 1.0)}
+    v = verdict("x", gaps(na_go), gaps(na_go), pers({"n/a": 9.0}), sizes({"n/a": 99.0}), taker(0.1))
+    assert v.label == "INVESTIGATE" and "no data" in v.reasons[0]
+    both = {"<0.5": (0.005, 0.0), "n/a": (0.09, 1.0)}
+    v = verdict("x", gaps(both), gaps(both), pers({"n/a": 9.0}), sizes({"n/a": 99.0}), taker(0.1))
+    assert v.label == "KILL"
+    assert not any(k.split(".")[1] == "n/a" for k in v.numbers if k.count(".") >= 2)

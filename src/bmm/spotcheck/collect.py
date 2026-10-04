@@ -40,6 +40,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 ATM_NEIGHBOURS = 5
 DF_FLAG_THRESHOLD = 0.01  # |dF| x digital delta, per $1
 EDGE_EXTRA_STRIKES = 2
+MAX_LADDER_FUT_NS = 5 * 1_000_000_000  # future quoted this long after the ladder: flag
 CAUGHT = (SourceError, ScaleError, asyncio.TimeoutError, ConnectionError)
 
 
@@ -143,13 +144,18 @@ async def collect_once(
     write_details: bool = False,
     log: Any = None,
     clock: Callable[[], int] | None = None,
+    sigma_memo: dict[str, float] | None = None,
 ) -> None:
     """One snapshot for one product. Raises SourceError/ScaleError/timeouts; writes nothing then.
 
     `ts_ns` is the slot time. The ladder, the future and the options are fetched one after the
     other, so each table records when its own fetch completed (`clock`), the future is re-quoted
     after the options, and F is the mean of the two. `df_flag` marks a snapshot where the move
-    between the two quotes times the digital delta at the ATM ladder strike exceeds 1c.
+    between the two quotes times the digital delta at the ATM ladder strike exceeds 1c. The delta
+    uses T to the venue fix and the chain's ATM sigma, or the product's last resolved sigma
+    (`sigma_memo`) if this snapshot's did not resolve; with neither, `df_flag` is null and metrics
+    treat the snapshot as flagged. The flag is also set when the future was quoted more than 5 s
+    after the ladder (the future cannot bracket the ladder then). Post-fix it is False.
     """
     log = log or structlog.get_logger()
     now = clock or (lambda: ts_ns)
@@ -226,13 +232,13 @@ async def collect_once(
     F = 0.5 * (f_before + f_after)
 
     option_rows: list[dict[str, Any]] = []
-    deltas: list[float] = []
+    sigmas: list[float] = []
     atm_k = min((r["strike"] for r in ladder_rows), key=lambda k: abs(k - F))
     for expiry, role_s, chain, opt_ts in chains:
         T = year_frac(ts_ns, expiry.expiry_ts_ns)
         sigma = atm_sigma(chain, F, T)
-        if sigma is not None and match is not None:
-            deltas.append(digital_delta(F, atm_k, sigma, T))
+        if sigma is not None:
+            sigmas.append(sigma)
         for c in sorted(chain, key=lambda c: c.strike):
             option_rows.append({
                 "snapshot_id": snapshot_id, "ts_ns": ts_ns, "product": spec.key,
@@ -244,10 +250,22 @@ async def collect_once(
                 "call_ask_size": getattr(c, "call_ask_size", None),
                 "opt_ts_ns": opt_ts, "und_px": F, "atm_sigma": sigma,
             })  # fmt: skip
-    df_flag = bool(deltas) and abs(f_after - f_before) * max(deltas) > DF_FLAG_THRESHOLD + 1e-12
+    if sigma_memo is not None and sigmas:
+        sigma_memo[spec.key] = sigmas[0]
+    sig_use = sigmas[0] if sigmas else (sigma_memo or {}).get(spec.key)
+    df_flag: bool | None
+    if ts_ns >= fix_ts:
+        df_flag = False  # settled: the ladder is no longer compared with the surface
+    elif fut_ts - ladder_ts > MAX_LADDER_FUT_NS:
+        df_flag = True
+    elif sig_use is None:
+        df_flag = None  # cannot size the move; metrics treat null as flagged
+    else:
+        dlt = digital_delta(F, atm_k, sig_use, year_frac(ts_ns, fix_ts))
+        df_flag = abs(f_after - f_before) * dlt > DF_FLAG_THRESHOLD + 1e-12
     if df_flag:
-        log.warning("future moved during the snapshot", product=spec.key, f_before=f_before,
-                    f_after=f_after)  # fmt: skip
+        log.warning("snapshot flagged (future moved or quoted late)", product=spec.key,
+                    f_before=f_before, f_after=f_after)  # fmt: skip
     fut_row = {
         "snapshot_id": snapshot_id, "ts_ns": ts_ns, "product": spec.key, "con_id": fut.con_id,
         "local_symbol": fut.local_symbol, "contract_month": fut.contract_month,
@@ -286,6 +304,7 @@ async def collect(
     fails = dict.fromkeys(specs, 0)
     oks = dict.fromkeys(specs, 0)
     last_err = dict.fromkeys(specs, "")
+    sigma_memo: dict[str, float] = {}
     active = set(specs)
     while active:
         slots: dict[str, int] = {}
@@ -309,6 +328,7 @@ async def collect(
                 await collect_once(
                     source, specs[k], question_date, sink, f"{k}-{ts}", ts, gc_month,
                     write_details=oks[k] == 0, log=log, clock=clock,
+                    sigma_memo=sigma_memo,
                 )  # fmt: skip
             except SafetyError:
                 raise  # never swallowed: it ends the session

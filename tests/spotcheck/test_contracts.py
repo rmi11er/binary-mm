@@ -167,3 +167,13 @@ def test_parse_month_without_anchor_and_strict_year():
     assert p("ES Dec-26 above 6500", QD, anchor=None, strict_year=True) == "202612"
     assert p("above 6500 on Oct 26", QD, anchor=None, strict_year=True) is None
     assert p("S&P Dec 2026 close", QD, anchor=None, strict_year=True) == "202612"
+
+
+def test_allowlist_compare_is_case_insensitive():
+    from dataclasses import replace
+
+    from bmm.spotcheck.contracts import option_class_ok
+
+    only = replace(PRODUCTS["cme-gold"], opt_trading_classes=("og",))
+    assert option_class_ok(only, "OG") and option_class_ok(only, " og ")
+    assert not option_class_ok(only, "G2")

@@ -53,7 +53,7 @@ FUTURES_SCHEMA: dict[str, Any] = {
     "fut_ts_ns": pl.Int64,  # when the first future quote was taken
     "und_px_before": pl.Float64,  # future mid before the option fetch
     "und_px_after": pl.Float64,  # future mid re-quoted after the option fetch
-    "df_flag": pl.Boolean,  # |dF| x digital delta at the ATM ladder strike > 1c
+    "df_flag": pl.Boolean,  # |dF| x digital delta > 1c (or late future); null = unknown
 }
 
 OPTIONS_SCHEMA: dict[str, Any] = {

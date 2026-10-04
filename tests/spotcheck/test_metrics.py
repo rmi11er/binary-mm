@@ -225,8 +225,11 @@ def _ef(rows):
             "opt_snapshot_id": "o",
             "opt_ts_ns": 0,
             "opt_expiry_ts_ns": 0,
+            "payout_scale": 1.0,
+            "expiry_role": "match",
         }
         d.update({k: v for k, v in r.items() if k not in ("gap", "i")})
+        d["ladder_ts_ns"] = r.get("ladder_ts_ns", d["ts_ns"])
         out.append(d)
     return pl.DataFrame(out, schema=metrics.EF_SCHEMA)
 
@@ -353,6 +356,7 @@ def test_arb_table_not_suspect_when_fresh_and_tight():
     ef, t = _arb_ef()
     a = arb_table(ef, t)
     assert a.height == 1 and a["suspect"][0] is False
+    assert a["arb_usd"][0] == pytest.approx(0.01 * 40, abs=1e-12)
     assert a["opt_rel_width"][0] == pytest.approx(0.01, abs=1e-9)
 
 
@@ -454,3 +458,143 @@ def test_edge_frame_carries_df_flag_from_futures():
         fut.append(r)
     ef = edge_frame(_tables(lad, opt, fut), 0.01).sort("ts_ns")
     assert ef["df_flag"].to_list() == [True, False]
+
+
+def _ef_days(spec):
+    """spec: list of (fix_ts_ns, i, gap_cents, extra overrides)."""
+    rows = [{"gap": g, "i": i, "fix_ts_ns": fix, **kw} for fix, i, g, kw in spec]
+    return _ef(rows)
+
+
+def test_persistence_does_not_join_runs_across_days():
+    day2 = FIX + 86400 * 10**9
+    ef = _ef_days([(FIX + 10**12, 0, 4, {}), (FIX + 10**12, 1, 4, {}),
+                   (day2 + 10**12, 2, 4, {}), (day2 + 10**12, 3, 4, {})])
+    # distinct sessions: fix_ts_ns differs, so two runs of 2 (not one of 4)
+    p = persistence(ef)
+    assert p["n_runs"][0] == 2 and p["max_run"][0] == 2
+
+
+def test_persistence_dropped_snapshot_breaks_run_via_grid():
+    fix = FIX + 10**12
+    ef = _ef_days([(fix, 0, 4, {}), (fix, 1, 4, {}), (fix, 3, 4, {}), (fix, 4, 4, {})])
+    grid = pl.DataFrame({"product": ["p"] * 5, "fix_ts_ns": [fix] * 5,
+                         "ts_ns": [FIX + i * MIN for i in range(5)]})  # fmt: skip
+    assert persistence(ef)["max_run"][0] == 4  # without the grid the gap is invisible
+    g = persistence(ef, grid=grid)
+    assert g["n_runs"][0] == 2 and g["max_run"][0] == 2  # snapshot 2 was dropped
+
+
+def test_persistence_mismatched_snapshot_mid_run_breaks_matched_run():
+    fix = FIX + 10**12
+    ef = _ef_days([(fix, 0, 4, {}), (fix, 1, 4, {}), (fix, 2, 4, {"expiry_mismatch": True}),
+                   (fix, 3, 4, {}), (fix, 4, 4, {})])  # fmt: skip
+    grid = pl.DataFrame({"product": ["p"] * 5, "fix_ts_ns": [fix] * 5,
+                         "ts_ns": [FIX + i * MIN for i in range(5)]})  # fmt: skip
+    matched = ef.filter(~pl.col("expiry_mismatch"))
+    p = persistence(matched, grid=grid)
+    assert p["n_runs"][0] == 2 and p["max_run"][0] == 2
+    assert persistence(ef, grid=grid)["max_run"][0] == 5
+
+
+def test_arb_lag_uses_real_fetch_timestamps_not_slot_ts():
+    chain = _chain()
+    ts = FIX - 10 * MIN
+    K = 6560.0
+    lad = [_ladder_row("s0", ts, K, 0.5, 0.52, ladder_ts_ns=ts + 1 * 10**9)]
+    opt = _opt_rows("s0", ts, chain)
+    for r in opt:
+        r["opt_ts_ns"] = ts + 9 * 10**9  # options fetched 8 s after the ladder
+    t = _tables(lad, opt)
+    ef = edge_frame(t, 0.01)
+    assert ef["ladder_ts_ns"][0] == ts + 10**9 and ef["opt_ts_ns"][0] == ts + 9 * 10**9
+    a = arb_table(ef, t)
+    assert a.height == 1  # venue 0.5 is hugely above the upper bound: sell arb
+    assert a["opt_ts_lag_ms"][0] == pytest.approx(8000.0, abs=1e-6)
+    assert a["suspect"][0] is True
+    lad2 = [_ladder_row("s0", ts, K, 0.5, 0.52, ladder_ts_ns=ts + 9 * 10**9 + 10**9)]
+    t2 = _tables(lad2, opt)
+    assert arb_table(edge_frame(t2, 0.01), t2)["suspect"][0] is False  # 1 s apart
+
+
+def test_arb_table_labels_post_fix_df_flag_and_stale_as_suspect():
+    ef, t = _arb_ef()
+    assert arb_table(ef.with_columns(df_flag=pl.lit(True)), t)["suspect"][0] is True
+    assert arb_table(ef.with_columns(stale_chain=pl.lit(True)), t)["suspect"][0] is True
+    a = arb_table(ef.with_columns(ttf_bucket=pl.lit("post-fix")), t)
+    assert a["suspect"][0] is True and a["post_fix"][0] is True
+
+
+def test_arb_usd_totals_split_suspect_and_scale_by_payout():
+    ef, t = _arb_ef()
+    ef = ef.with_columns(payout_scale=pl.lit(100.0), arb_sell_edge=pl.lit(0.02), bid_size=pl.lit(10))
+    a = arb_table(ef, t)
+    # (0.01 * ask 40 + 0.02 * bid 10) * 100
+    assert a["arb_usd"][0] == pytest.approx((0.4 + 0.2) * 100, abs=1e-9)
+    tot = metrics.arb_totals(a)
+    assert tot["arb_usd"].sum() == pytest.approx(60.0, abs=1e-6) and tot["suspect"].to_list() == [False]
+
+
+def test_taker_capturable_scales_with_payout_and_has_threshold_columns():
+    rows = [{"gap": 0, "i": 0, "take_buy_edge": 0.03, "take_sell_edge": None, "ask_size": 10,
+             "payout_scale": 100.0}]
+    r = taker_stats(_ef(rows), fees=(0.02,)).row(0, named=True)
+    assert r["capturable_median"] == pytest.approx(0.03 * 10 * 100, abs=1e-9)
+    assert r["capturable_gt_2c_median"] == pytest.approx(30.0, abs=1e-9)
+    assert r["capturable_gt_1c_median"] == pytest.approx(30.0, abs=1e-9)
+    r2 = taker_stats(_ef([{**rows[0], "take_buy_edge": 0.015}]), fees=(0.02,)).row(0, named=True)
+    assert r2["capturable_gt_1c_median"] > 0 and r2["capturable_gt_2c_median"] == 0.0
+
+
+def test_null_df_flag_is_treated_as_flagged():
+    chain = _chain()
+    ts = FIX - 10 * MIN
+    lad = [_ladder_row("s0", ts, 6560.0, 0.12, 0.14), _ladder_row("s1", ts + MIN, 6560.0, 0.12, 0.14),
+           _ladder_row("s2", ts + 2 * MIN, 6560.0, 0.12, 0.14)]
+    opt = [r for i, t in enumerate((ts, ts + MIN, ts + 2 * MIN)) for r in _opt_rows(f"s{i}", t, chain)]
+    fut = []
+    for sid, flag in (("s0", None), ("s1", False), ("s2", True)):
+        r = dict.fromkeys(FUTURES_SCHEMA)
+        r.update(snapshot_id=sid, df_flag=flag)
+        fut.append(r)
+    ef = edge_frame(_tables(lad, opt, fut), 0.01).sort("ts_ns")
+    assert ef["df_flag"].to_list() == [True, False, True]
+    assert gap_stats(ef)["n"].sum() == 1
+
+
+def test_post_fix_always_uses_last_pre_fix_chain():
+    chain = _chain()
+    far = [OptQuote(q.strike, q.call_bid + 3, q.call_ask + 3) for q in chain]
+    t1, t2 = FIX - MIN, FIX + 2 * MIN
+    lad = [_ladder_row("s0", t1, 6560.0, 0.12, 0.14), _ladder_row("s1", t2, 6560.0, 0.12, 0.14)]
+    opt = _opt_rows("s0", t1, chain) + _opt_rows("s1", t2, far, role="above", mismatch=True,
+                                                  expiry=FIX + 600 * MIN)
+    ef = edge_frame(_tables(lad, opt), 0.01).sort("ts_ns")
+    pre, post = ef.row(0, named=True), ef.row(1, named=True)
+    assert post["fair"] == pytest.approx(pre["fair"], abs=1e-12)
+    assert post["stale_chain"] is True and post["opt_snapshot_id"] == "s0"
+    assert post["expiry_mismatch"] is False
+
+
+def test_gap_stats_has_per_snapshot_columns():
+    rows = [{"gap": 4, "i": 0, "strike": 1.0}, {"gap": 1, "i": 0, "strike": 2.0},
+            {"gap": 5, "i": 1, "strike": 1.0}, {"gap": 5, "i": 1, "strike": 2.0}]
+    g = gap_stats(_ef(rows)).row(0, named=True)
+    assert g["pct_gt_3c"] == pytest.approx(0.75, abs=1e-12)  # per observation
+    # snapshot medians: (4,1) -> 2.5c (no), (5,5) -> 5c (yes)
+    assert g["pct_snapshots_gt_3c"] == pytest.approx(0.5, abs=1e-12)
+    assert g["pct_snapshots_gt_2c"] == pytest.approx(1.0, abs=1e-12)
+    assert g["n_snapshots"] == 2
+
+
+def test_mismatch_tilt_by_role():
+    rows = [
+        {"gap": 4, "i": 0, "F": 100.0, "strike": 90.0, "expiry_role": "above"},   # K<F: +4
+        {"gap": 4, "i": 1, "F": 100.0, "strike": 110.0, "expiry_role": "above"},  # K>F: -4
+        {"gap": 6, "i": 2, "F": 100.0, "strike": 90.0, "expiry_role": "below"},
+        {"gap": 1, "i": 3, "F": 100.0, "strike": 100.0, "expiry_role": "below"},  # K==F: dropped
+    ]
+    t = metrics.mismatch_tilt(_ef(rows))
+    by = {r["expiry_role"]: r for r in t.iter_rows(named=True)}
+    assert by["above"]["median_tilt"] == pytest.approx(0.0, abs=1e-12) and by["above"]["n"] == 2
+    assert by["below"]["median_tilt"] == pytest.approx(0.06, abs=1e-12) and by["below"]["n"] == 1
