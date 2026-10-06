@@ -124,3 +124,33 @@ def test_sensitivity_reports_whether_top10_changes(tmp_path):
         "changed",
         "moved",
     }
+
+
+def test_intermittent_program_judged_per_active_hour(tmp_path):
+    hot = {
+        "schedule": make_schedule([(None, TS + H, 15.0)]),
+        "end_ns": TS + H,
+        "pool_usd": 15.0,
+        "R_usd_hr": 15.0,
+    }
+    seed2(tmp_path, [("BURST", {}, hot)])
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert a.defects and all(
+        "per active hour" in r for d in a.defects for r in d["reasons"] if "RoC" in r
+    )
+
+
+def test_zero_collateral_is_a_defect(tmp_path):
+    seed2(tmp_path, [("FREE", {"coll_side": 0.0}, {}), ("OK1", {}, {})])
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert any(
+        "collateral" in r for d in a.defects for r in d["reasons"] if d["market"] == "v:FREE"
+    )
+    assert not any("FREE" in k and x.s > 0 for k, x in a.allocs.items())
+
+
+def test_tiny_posted_collateral_does_not_fake_a_defect(tmp_path):
+    seed2(
+        tmp_path, [("TAIL", {"coll_side": 0.005}, {})]
+    )  # jump (0.49) is the capital at risk, not 0.005
+    assert not analyze(DATE, tmp_path, ADS, GEM).defects

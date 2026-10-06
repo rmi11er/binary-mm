@@ -279,22 +279,28 @@ def analyze(
     # --- sanity guard: RoC > 100%/day or reward above the pool still to be paid = DEFECT ---
     stats: dict[str, dict[str, float]] = {}
     mkt_reward: defaultdict[str, float] = defaultdict(float)
-    for h, _ in pre:
+    guarded = [
+        (h, r) for h, r in an.halves if not h.c_lower_bound
+    ]  # lower-bound cost overstates RoC
+    for h, _ in guarded:
         s0 = s_star(h, _cap(h))
-        rd, cd, col = h.hours24 * h.reward(s0), h.hours24 * h.c * s0, s0 * h.coll
-        stats[h.key] = {
-            "s0": s0,
-            "rd": rd,
-            "cd": cd,
-            "col": col,
-            "roc": (rd - cd) / col if col > 0 else 0.0,
-        }
+        rd, cd = h.hours24 * h.reward(s0), h.hours24 * h.c * s0
+        col = s0 * max(
+            h.coll, h.stress_per
+        )  # at extreme prices posted collateral ~0: the jump is the capital at risk
+        roc = (rd - cd) / col if col > 0 else 0.0
+        stats[h.key] = {"s0": s0, "rd": rd, "cd": cd, "col": col, "roc": roc,
+                        "roc_active": roc * max(1.0, 24.0 / h.hours24)}  # fmt: skip
         mkt_reward[h.market] += rd
     defect_keys: set[str] = set()
-    for h, r in pre:
+    for h, r in guarded:
         st, pool, reasons = stats[h.key], an.pools[h.key], []
-        if st["roc"] > MAX_ROC_DAY:
-            reasons.append(f"RoC {st['roc']:.0%}/day > {MAX_ROC_DAY:.0%}")
+        if h.coll <= 0:
+            reasons.append("collateral per contract <= 0")
+        if st["roc_active"] > MAX_ROC_DAY:
+            reasons.append(
+                f"RoC {st['roc_active']:.0%}/day (per active hour, scaled to 24h) > {MAX_ROC_DAY:.0%}"
+            )
         if mkt_reward[h.market] > pool * (1 + 1e-6) + 1e-9:
             reasons.append(f"reward ${mkt_reward[h.market]:,.2f}/day > pool remaining ${pool:,.2f}")
         if reasons:
@@ -303,7 +309,7 @@ def analyze(
                 {"market": h.market, "key": h.key, "side": r["side"], "reasons": reasons,
                  "inputs": {"R_side": r.get("R_side"), "hours24": h.hours24, "pool_remaining": pool,
                             "D_side": r.get("D_side"), "c": h.c, "coll": h.coll, "s0": st["s0"],
-                            "reward_day": st["rd"], "cost_day": st["cd"], "roc": st["roc"],
+                            "reward_day": st["rd"], "cost_day": st["cd"], "roc": st["roc_active"],
                             "markout": an.markout[h.key], "fills": an.fills[h.key],
                             "flags": " ".join(an.flags[h.key])}}
             )  # fmt: skip

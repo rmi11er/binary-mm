@@ -26,15 +26,18 @@ from bmm.scan.venues.common import (
 API = "https://external-api.kalshi.com/trade-api/v2"
 
 
-def _grid(pts: list[tuple[int, float]], step: int) -> list[tuple[int, float]]:
-    """Forward-fill sparse candle mids onto a regular grid between the first and last candle."""
+def _grid(
+    pts: list[tuple[int, float]], step: int, max_gap: int = 30 * 60 * 10**9
+) -> list[tuple[int, float]]:
+    """Forward-fill sparse candle mids onto a regular grid, at most `max_gap` past the last candle."""
     if not pts:
         return []
     tss = [t for t, _ in pts]
     out = []
     for g in range(-(-tss[0] // step), tss[-1] // step + 1):
         i = bisect.bisect_right(tss, g * step) - 1
-        out.append((g * step, pts[i][1]))
+        if g * step - tss[i] <= max_gap:
+            out.append((g * step, pts[i][1]))
     return out
 
 
@@ -151,7 +154,7 @@ class Kalshi:
                     (c.get("yes_bid") or {}).get("close_dollars"),
                     (c.get("yes_ask") or {}).get("close_dollars"),
                 )
-                if b is not None and a is not None:
+                if b is not None and a is not None and float(b) > 0 and float(a) < 1:
                     pts.append((int(c["end_period_ts"]) * 10**9, (float(b) + float(a)) / 2))
             return sorted(pts)
 

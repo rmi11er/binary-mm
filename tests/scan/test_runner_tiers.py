@@ -165,7 +165,9 @@ class K(A):
 def test_kalshi_backfill_stores_cursor_and_resumes_incrementally(tmp_path):
     k = K()
     out = asyncio.run(snapshot_once([k], NOW, root=tmp_path))
-    assert out["cursors"] == [{"venue": "v", "market_id": "m", "cursor": "c1", "ts_ns": NOW}]
+    assert out["cursors"] == [
+        {"venue": "v", "market_id": "m", "cursor": "c1", "min_ts": NOW - 7 * DAY, "ts_ns": NOW}
+    ]
     for t, rws in out.items():
         store.write(t, rws, NOW, tmp_path)
     k2 = K()
@@ -174,6 +176,41 @@ def test_kalshi_backfill_stores_cursor_and_resumes_incrementally(tmp_path):
     out2 = asyncio.run(snapshot_once([k2], later, root=tmp_path))
     assert k2.calls[1:] == [
         (NOW - 2 * H_NS + 1, None),
-        (later - 7 * DAY, "c1"),
+        (NOW - 7 * DAY, "c1"),  # replayed with the ORIGINAL min_ts
     ]  # newest first, then older pages
     assert out2["cursors"][0]["cursor"] == ""  # finished: nothing to resume next time
+
+
+def test_old_trade_derived_proxy_rows_count_as_weak(tmp_path):
+    rows_ = [{"venue": "v", "market_id": "m", "ts_ns": NOW - DAY + i * 300 * 10**9, "mid": 0.5, "kind": "fine",
+              "source": "trade_derived"} for i in range(200)]  # fmt: skip
+    store.write("proxy_mids", rows_, NOW, tmp_path)
+    r = rows(asyncio.run(snapshot_once([A()], NOW, root=tmp_path)))
+    assert r["weak_proxy"] is True and r["mid_source"] == "trade_derived"
+
+
+class G(A):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def trades_resume(self, market_id, since_ns, cursor):
+        self.calls.append((since_ns, cursor))
+        if cursor == "g1":
+            return [Trade(NOW + 100 * 10**9, 0.49, 1.0, "sell")], ""
+        if cursor is None and len(self.calls) == 1:
+            return [Trade(NOW - 2 * H_NS, 0.49, 1.0, "sell")], ""
+        if cursor is None:
+            return [
+                Trade(NOW + 200 * 10**9, 0.49, 1.0, "sell")
+            ], "g1"  # more than one page since last scan
+        return [], ""
+
+
+def test_gap_since_last_scan_is_paged_until_closed(tmp_path):
+    g = G()
+    for t, rws in asyncio.run(snapshot_once([g], NOW, root=tmp_path)).items():
+        store.write(t, rws, NOW, tmp_path)
+    out = asyncio.run(snapshot_once([g], NOW + H_NS, root=tmp_path))
+    assert (NOW - 2 * H_NS + 1, "g1") in g.calls  # followed the cursor of the new-trades fetch
+    assert len(out["trades"]) == 2  # both pages kept

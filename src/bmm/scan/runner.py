@@ -63,6 +63,7 @@ EMPTY_MIDS = pl.DataFrame(
     {"ts_ns": pl.Series([], dtype=pl.Int64), "mid": pl.Series([], dtype=pl.Float64)}
 )
 TRADE_COLS = ["ts_ns", "price", "size", "aggressor"]
+WEAK_SOURCES = ("trade_buysell", "trade_derived")  # trade-derived mids (old and new labels)
 
 
 def due_full(last_full: int | None, now: int, period_ns: int = FULL_PERIOD_NS) -> bool:
@@ -146,19 +147,39 @@ async def _market_rows(
     resume = getattr(a, "trades_resume", None)
     if callable(resume):
         cur_rows = _sel(ctx.cursors, a.name, mkt)
-        stored_cur = (
-            str(cur_rows.sort("ts_ns")["cursor"][-1] or "") if not cur_rows.is_empty() else ""
-        )
+        latest = cur_rows.sort("ts_ns").tail(1) if not cur_rows.is_empty() else None
+        stored_cur = str(latest["cursor"][0] or "") if latest is not None else ""
+        stored_min = now - BACKFILL_NS
+        if latest is not None and "min_ts" in latest.columns and latest["min_ts"][0] is not None:
+            stored_min = int(latest["min_ts"][0])
+        cursor_min = stored_min
         if not last:  # first sight: newest pages of the 7d window
-            new, cursor_out = await resume(mkt, now - BACKFILL_NS, None)
+            cursor_min = now - BACKFILL_NS
+            new, cursor_out = await resume(mkt, cursor_min, None)
         else:
-            new, _ = await resume(mkt, last + 1, None)  # what is new since the last scan
+            new, gap = await resume(mkt, last + 1, None)  # what is new since the last scan
+            for _ in range(20):  # never leave a gap between scans: page until it is closed
+                if not gap:
+                    break
+                more, gap = await resume(mkt, last + 1, gap)
+                new = more + new
             cursor_out = stored_cur
-            if stored_cur and write_terms:  # older pages are fetched by the hourly tier only
-                older, cursor_out = await resume(mkt, now - BACKFILL_NS, stored_cur)
-                new = older + new
+            if (
+                stored_cur and write_terms
+            ):  # older pages: hourly tier, with the min_ts that issued the cursor
+                if stored_min >= now - BACKFILL_NS - DAY_NS:
+                    older, cursor_out = await resume(mkt, stored_min, stored_cur)
+                    new = older + new
+                else:
+                    cursor_out = ""  # backfill stalled for over a day: give up on the old pages
         out["cursors"].append(
-            {"venue": a.name, "market_id": mkt, "cursor": cursor_out or "", "ts_ns": now}
+            {
+                "venue": a.name,
+                "market_id": mkt,
+                "cursor": cursor_out or "",
+                "min_ts": cursor_min,
+                "ts_ns": now,
+            }
         )
     else:
         new = await a.trades(mkt, max(now - BACKFILL_NS, last + 1) if last else now - BACKFILL_NS)
@@ -227,9 +248,7 @@ async def _market_rows(
     first_org = int(org["ts_ns"].min()) if not org.is_empty() else now + 1  # type: ignore[arg-type]
     tr_pre = tr_all.filter(pl.col("ts_ns") < first_org) if not tr_all.is_empty() else tr_all
     vol30, _ = mean_abs_move(fine, MARKOUT_NS)
-    p99 = tail_move_1h(
-        fine, coarse, fine_obs=len(trade_objs) if source == "trade_buysell" else None
-    )
+    p99 = tail_move_1h(fine, coarse, fine_obs=len(trade_objs) if source in WEAK_SOURCES else None)
 
     # --- fills: tape where there is one, else estimated from sharesTraded ---
     no_tape = bool(cfg and cfg.raw.get("trades_aggressor") == "none")
@@ -287,7 +306,7 @@ async def _market_rows(
                 "shares_traded": book.shares_traded,
                 "markout_30m_side": m_org, "n_markout_side": n_org,
                 "markout_proxied_side": m_prox, "n_markout_proxied_side": n_prox,
-                "mid_source": source, "weak_proxy": source == "trade_buysell",
+                "mid_source": source, "weak_proxy": source in WEAK_SOURCES,
                 "vol30_proxy": vol30, "jump_p99_1h": p99,
                 "n_trades_side": sum(1 for t in tr_24 if side_of(t, mid) == s),
                 "coll_side": eval_coll(str(expr), px), "coll_verified": verified,

@@ -136,25 +136,33 @@ STEP_NS = 5 * 60 * 10**9
 MIN_JUMP = 0.01  # one tick: floor on the adverse jump
 
 
-def resample_trades(trades: list[Trade], step_ns: int = STEP_NS) -> list[tuple[int, float]]:
+def resample_trades(
+    trades: list[Trade], step_ns: int = STEP_NS, max_age_buckets: int = 6
+) -> list[tuple[int, float]]:
     """WEAK proxy mid: per 5-minute bucket, the average of the last buy and last sell price (each
-    carried forward until replaced). Cancels most of the bid-ask bounce a raw last-trade series has.
-    Stamped at bucket end; nothing until both sides have traded. Trades without an aggressor are
-    ignored."""
+    carried forward until replaced, but at most `max_age_buckets` buckets: a stale side would lag
+    a trend and fake a jump when it finally prints). Stamped at bucket end; nothing until both
+    sides are fresh. Trades without an aggressor are ignored."""
     ts = sorted((t for t in trades if t.aggressor in ("buy", "sell")), key=lambda t: t.ts_ns)
     if not ts:
         return []
     out: list[tuple[int, float]] = []
     i = 0
     last_b = last_s = None
+    idx_b = idx_s = 0
     for b in range(ts[0].ts_ns // step_ns, ts[-1].ts_ns // step_ns + 1):
         while i < len(ts) and ts[i].ts_ns // step_ns <= b:
             if ts[i].aggressor == "buy":
-                last_b = ts[i].price
+                last_b, idx_b = ts[i].price, ts[i].ts_ns // step_ns
             else:
-                last_s = ts[i].price
+                last_s, idx_s = ts[i].price, ts[i].ts_ns // step_ns
             i += 1
-        if last_b is not None and last_s is not None:
+        if (
+            last_b is not None
+            and last_s is not None
+            and b - idx_b <= max_age_buckets
+            and b - idx_s <= max_age_buckets
+        ):
             out.append(((b + 1) * step_ns, (last_b + last_s) / 2))
     return out
 

@@ -82,3 +82,22 @@ def test_weak_proxy_mid_is_average_of_last_buy_and_last_sell_per_bucket():
     # bucket 1: buy .60 / sell .50 -> .55; bucket 2: only a buy .62, sell carried (.50) -> .56
     assert resample_trades(t) == [(5 * M, pytest.approx(0.55)), (10 * M, pytest.approx(0.56))]
     assert resample_trades([Trade(1 * M, 0.60, 1.0, "buy")]) == []  # one side only: no mid yet
+
+
+def test_weak_proxy_drops_a_stale_side():
+    t = [
+        Trade(1 * M, 0.60, 1.0, "buy"),
+        Trade(2 * M, 0.50, 1.0, "sell"),
+        Trade(62 * M, 0.70, 1.0, "buy"),
+    ]
+    out = resample_trades(t)
+    assert (
+        len(out) == 7 and out[-1][0] == 35 * M
+    )  # sell side older than 30 min: no mid, no fake jump
+
+
+def test_candle_grid_caps_forward_fill():
+    from bmm.scan.venues.kalshi import _grid
+
+    g = dict(_grid([(0, 0.5), (100 * M, 0.6)], 5 * M))
+    assert g[25 * M] == 0.5 and 50 * M not in g and g[100 * M] == 0.6
