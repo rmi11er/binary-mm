@@ -56,6 +56,9 @@ coll_verified = true
 coll_source = "https://docs.polymarket.us/market-structure/collateral-and-margin.md"
 maker_fee = 0.0
 maker_rebate = 0.0125         # theta = -0.0125 -> $0.0125 * p * (1-p) per contract at time of trade
+taker_fee = 0.0695            # coefficient on p(1-p) per contract
+taker_fee_verified = true
+taker_fee_source = "https://docs.polymarket.us/fees.md"
 fee_verified = true
 fee_source = "https://docs.polymarket.us/fees.md"
 settle_source_field = "description (free text in /v1/markets); settlementPriceCalculationMethod in book stats; /v1/markets/{slug}/settlement has no source field"
@@ -108,6 +111,7 @@ coll_verified = false         # orderbook equivalence is documented; amount rese
 coll_source = "https://docs.kalshi.com/getting_started/orderbook_responses.md"
 maker_fee = 0.0               # makers pay nothing on most series; series with fee_type *_maker_fees charge a maker fee
 maker_rebate = 0.0
+# taker_fee: unverified [?] (fee schedule PDF returned HTTP 429) -> stale / takeable are not scored for kalshi
 fee_verified = false          # maker coefficient (0.0175) only seen in secondary summaries; fee schedule PDF returned HTTP 429
 fee_source = "https://docs.kalshi.com/api-reference/exchange/get-series-fee-changes.md (per-series fee_type); https://news.kalshi.com/p/makers-and-takers (older: resting orders exempt)"
 maker_fee_if_series_flagged = 0.0175   # [S] secondary only
@@ -162,6 +166,8 @@ coll_verified = false
 coll_source = ""
 maker_fee = 0.0175            # maker fee = 0.0175 * C * p(1-p)
 maker_rebate = 0.021          # 0.30 rebate rate * 0.07 taker rate; only for orders filled in $0.20-$0.80 on contracts listed after 2026-03-18; cap 5% of fill notional
+taker_fee = 0.07              # coefficient on p(1-p); implied by the rebate rule (0.30 x 0.07), not stated on the fee page
+taker_fee_verified = false
 fee_verified = true
 fee_net_verified = false      # unclear whether an eligible order pays the maker fee AND gets the rebate, or the rebate replaces it
 fee_source = "https://www.gemini.com/fees/predictions ; https://developer.gemini.com/prediction-markets/maker-rebate-program"

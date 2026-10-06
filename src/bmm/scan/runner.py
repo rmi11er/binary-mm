@@ -265,6 +265,15 @@ async def _market_rows(
         total_est = fills_from_shares(float(book.shares_traded or 0.0), now, book.opened_ns, prev)
 
     reason = exclusion(meta, book, now)
+    ref_fair: float | None = None  # only venue_ref markets, only if the adapter can supply one
+    ref_fn = getattr(a, "reference_fair", None)
+    if meta.reference_quality == "venue_ref" and callable(ref_fn):
+        try:
+            ref_fair = await ref_fn(mkt)
+        except (VenueNotPublic, KeyError, ValueError) as e:
+            log.warning("reference %s/%s unavailable: %r", a.name, mkt, e)
+    bid_size = book.bids[0].size if book.bids else None
+    ask_size = book.asks[0].size if book.asks else None
     pq = mid * (1 - mid) if mid is not None else 0.25  # fee/rebate coefficients scale with p(1-p)
     split = float(cfg.raw.get("side_split", 0.5)) if cfg else 0.5
     verified = bool(cfg.raw.get("coll_verified", False)) if cfg else False
@@ -307,6 +316,8 @@ async def _market_rows(
                 "markout_30m_side": m_org, "n_markout_side": n_org,
                 "markout_proxied_side": m_prox, "n_markout_proxied_side": n_prox,
                 "mid_source": source, "weak_proxy": source in WEAK_SOURCES,
+                "tier": "full" if write_terms else "fast", "bid_size": bid_size, "ask_size": ask_size,
+                "ref_fair": ref_fair, "taker_fee_coeff": cfg.raw.get("taker_fee") if cfg else None,
                 "vol30_proxy": vol30, "jump_p99_1h": p99,
                 "n_trades_side": sum(1 for t in tr_24 if side_of(t, mid) == s),
                 "coll_side": eval_coll(str(expr), px), "coll_verified": verified,
