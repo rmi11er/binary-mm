@@ -149,8 +149,21 @@ def test_zero_collateral_is_a_defect(tmp_path):
     assert not any("FREE" in k and x.s > 0 for k, x in a.allocs.items())
 
 
-def test_tiny_posted_collateral_does_not_fake_a_defect(tmp_path):
+def test_tiny_posted_collateral_is_flagged_on_the_collateral_basis(tmp_path):
     seed2(
-        tmp_path, [("TAIL", {"coll_side": 0.005}, {})]
-    )  # jump (0.49) is the capital at risk, not 0.005
-    assert not analyze(DATE, tmp_path, ADS, GEM).defects
+        tmp_path, [("TAIL", {"coll_side": 0.005}, {}), ("OK1", {}, {})]
+    )  # RoC is on COLLATERAL, per spec
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert any(d["market"] == "v:TAIL" and any("RoC" in r for r in d["reasons"]) for d in a.defects)
+    assert not any(d["market"] == "v:OK1" for d in a.defects)
+
+
+def test_budget_limited_small_size_is_listed_not_excluded(tmp_path):
+    seed2(
+        tmp_path, [(f"M{i}", {}, {}) for i in range(20)]
+    )  # 20 markets share the 10% stress budget
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert a.defects == []  # at the standalone size RoC is well under 100%/day
+    assert a.over_at_alloc and all(o["roc"] > 1.0 for o in a.over_at_alloc)
+    assert sum(1 for x in a.allocs.values() if x.s > 0) > 0  # still allocated
+    assert "Allocated above 100%/day" in build_report(DATE, tmp_path, adapters=ADS, conf=GEM)

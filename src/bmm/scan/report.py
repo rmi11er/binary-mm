@@ -130,6 +130,9 @@ class Analysis:
     excluded: list[dict[str, Any]] = field(default_factory=list)
     blocked: list[tuple[str, str, str]] = field(default_factory=list)  # venue, market, reason
     defects: list[dict[str, Any]] = field(default_factory=list)
+    over_at_alloc: list[dict[str, Any]] = field(
+        default_factory=list
+    )  # RoC > 100%/day at the allocated size
     eligible: set[str] = field(default_factory=set)  # half keys that entered allocation
     unknown_conc: int = 0
     standalone: dict[str, float] = field(default_factory=dict)  # "venue:market" -> net $/day at s*
@@ -288,9 +291,9 @@ def analyze(
     for h, _ in guarded:
         s0 = s_star(h, _cap(h))
         rd, cd = h.hours24 * h.reward(s0), h.hours24 * h.c * s0
-        col = s0 * max(
-            h.coll, h.stress_per
-        )  # at extreme prices posted collateral ~0: the jump is the capital at risk
+        col = (
+            s0 * h.coll
+        )  # return ON COLLATERAL, as specified (tail-price quotes with ~0 collateral are flagged)
         roc = (rd - cd) / col if col > 0 else 0.0
         stats[h.key] = {"s0": s0, "rd": rd, "cd": cd, "col": col, "roc": roc,
                         "roc_active": roc * max(1.0, 24.0 / h.hours24)}  # fmt: skip
@@ -325,6 +328,19 @@ def analyze(
             stress_mkt_cap=STRESS_MKT, stress_total_cap=STRESS_TOTAL, bankroll=BUDGET,
         )
     }  # fmt: skip
+    by_key = {h.key: h for h, _ in eligible}
+    an.over_at_alloc = [
+        {
+            "market": by_key[x.key].market,
+            "side": an.info[x.key]["side"],
+            "s": x.s,
+            "collateral": x.collateral,
+            "roc": x.roc_day,
+            "hours24": by_key[x.key].hours24,
+        }
+        for x in an.allocs.values()
+        if x.s > 0 and x.roc_day > MAX_ROC_DAY
+    ]
     for (
         h,
         _,
@@ -716,6 +732,20 @@ def build_report(
                 ]
                 for d in an.defects
                 for i in [d["inputs"]]
+            ],
+        )
+    )
+    s7 += (
+        "\n\n### Allocated above 100%/day at their allocated size (not excluded)\n\n"
+        f"RoC > 100%/day at the allocated size: {len(an.over_at_alloc)}. The DEFECT test runs at the "
+        "standalone size s*. When the collateral/stress budget forces a smaller size the return on the "
+        "first contracts is higher (concave reward), so these are budget-limited, not defective by the "
+        "rule; they are listed so they can be judged.\n\n"
+        + _table(
+            ["market", "side", "s", "collateral $", "RoC/day", "hours24"],
+            [
+                [o["market"], o["side"], o["s"], o["collateral"], o["roc"], o["hours24"]]
+                for o in an.over_at_alloc
             ],
         )
     )
