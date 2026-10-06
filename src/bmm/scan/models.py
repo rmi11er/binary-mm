@@ -30,6 +30,10 @@ class Program:
     maker_fee: float
     maker_rebate: float
     raw_hash: str
+    start_ns: int | None = None  # current period start (None = unknown / already running)
+    end_ns: int | None = None  # current period end (None = open-ended)
+    pool_usd: float = 0.0  # pool of the current period
+    schedule: str = "[]"  # JSON [[start|null, end|null, usd_per_hr], ...]; see schedule.py
 
 
 @dataclass(frozen=True)

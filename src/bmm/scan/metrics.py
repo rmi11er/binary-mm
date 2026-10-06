@@ -137,17 +137,25 @@ MIN_JUMP = 0.01  # one tick: floor on the adverse jump
 
 
 def resample_trades(trades: list[Trade], step_ns: int = STEP_NS) -> list[tuple[int, float]]:
-    """Last trade price per 5-minute bucket, forward-filled: a mid proxy for venues with only a tape."""
-    if not trades:
+    """WEAK proxy mid: per 5-minute bucket, the average of the last buy and last sell price (each
+    carried forward until replaced). Cancels most of the bid-ask bounce a raw last-trade series has.
+    Stamped at bucket end; nothing until both sides have traded. Trades without an aggressor are
+    ignored."""
+    ts = sorted((t for t in trades if t.aggressor in ("buy", "sell")), key=lambda t: t.ts_ns)
+    if not ts:
         return []
-    ts = sorted(trades, key=lambda t: t.ts_ns)
     out: list[tuple[int, float]] = []
-    i, px = 0, ts[0].price
+    i = 0
+    last_b = last_s = None
     for b in range(ts[0].ts_ns // step_ns, ts[-1].ts_ns // step_ns + 1):
         while i < len(ts) and ts[i].ts_ns // step_ns <= b:
-            px = ts[i].price
+            if ts[i].aggressor == "buy":
+                last_b = ts[i].price
+            else:
+                last_s = ts[i].price
             i += 1
-        out.append(((b + 1) * step_ns, px))  # stamped at bucket END: no look-ahead into the bucket
+        if last_b is not None and last_s is not None:
+            out.append(((b + 1) * step_ns, (last_b + last_s) / 2))
     return out
 
 

@@ -14,13 +14,9 @@ M = 60 * 10**9
 H = 60 * M
 
 
-def test_resample_trades_last_price_forward_filled():
+def test_resample_trades_needs_both_sides():
     t = [Trade(0, 0.4, 1.0, "buy"), Trade(12 * M, 0.5, 1.0, "sell")]
-    assert resample_trades(t) == [
-        (5 * M, 0.4),
-        (10 * M, 0.4),
-        (15 * M, 0.5),
-    ]  # stamped at bucket end
+    assert resample_trades(t) == [(15 * M, pytest.approx(0.45))]  # first mid once both sides exist
     assert resample_trades([]) == []
 
 
@@ -75,3 +71,14 @@ def test_fills_from_shares():
     assert fills_from_shares(100.0, 10 * H, 0, (10 * H - 30 * M, 99.0)) == pytest.approx(10.0)
     assert fills_from_shares(100.0, 10 * H, 0, (8 * H, 150.0)) == pytest.approx(10.0)  # reset
     assert fills_from_shares(100.0, 10 * H, None, None) is None
+
+
+def test_weak_proxy_mid_is_average_of_last_buy_and_last_sell_per_bucket():
+    t = [
+        Trade(1 * M, 0.60, 1.0, "buy"),
+        Trade(2 * M, 0.50, 1.0, "sell"),
+        Trade(6 * M, 0.62, 1.0, "buy"),
+    ]
+    # bucket 1: buy .60 / sell .50 -> .55; bucket 2: only a buy .62, sell carried (.50) -> .56
+    assert resample_trades(t) == [(5 * M, pytest.approx(0.55)), (10 * M, pytest.approx(0.56))]
+    assert resample_trades([Trade(1 * M, 0.60, 1.0, "buy")]) == []  # one side only: no mid yet

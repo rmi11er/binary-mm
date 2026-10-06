@@ -155,3 +155,65 @@ def test_taxonomy_and_jump_class(texts, cat, jump):
 
     got = classify(*texts)
     assert got == cat and jump_class(got, *texts) == jump
+
+
+def test_kalshi_price_history_uses_candle_bid_ask_mid_and_caches_series(fake_client):
+    import json
+
+    from .conftest import FIX
+
+    a = make("kalshi", fake_client)
+    fine, coarse = asyncio.run(a.price_history("KXHORMUZWEEKLY-26OCT04-T20"))
+    assert a.history_source == "candles" and fine and coarse
+    assert all(0 < m < 1 for _, m in fine + coarse) and [t for t, _ in fine] == sorted(
+        t for t, _ in fine
+    )
+    c = json.loads((FIX / "kalshi/candles_60m.json").read_text())["candlesticks"]
+    first = next(
+        x for x in c if x["yes_bid"].get("close_dollars") and x["yes_ask"].get("close_dollars")
+    )
+    want = (float(first["yes_bid"]["close_dollars"]) + float(first["yes_ask"]["close_dollars"])) / 2
+    assert coarse[0][1] == pytest.approx(want)
+    n_events = sum("/events/" in u for u, _ in a.c.calls)
+    asyncio.run(a.price_history("KXHORMUZWEEKLY-26OCT04-T20"))
+    assert sum("/events/" in u for u, _ in a.c.calls) == n_events  # series ticker cached
+
+
+def test_kalshi_trades_resume_returns_and_follows_cursor(fake_client):
+    from bmm.scan.config import VenueCfg
+
+    cfg = VenueCfg("kalshi", {**CFG.venue["kalshi"].raw, "trade_pages": 1})
+    a = ADAPTERS["kalshi"](fake_client("kalshi"), cfg)
+    trades, cur = asyncio.run(a.trades_resume("T", 0, None))
+    assert trades and cur  # page cap reached with older pages still behind it
+    asyncio.run(a.trades_resume("T", 0, cur))
+    assert a.c.calls[-1][1]["cursor"] == cur
+
+    class Done(fake_client):
+        async def get_json(self, url, params=None):
+            return {"trades": [], "cursor": ""}
+
+    b = ADAPTERS["kalshi"](Done("kalshi"), cfg)
+    assert asyncio.run(b.trades_resume("T", 0, cur)) == ([], "")
+
+
+def test_program_schedules_come_from_venue_times(fake_client):
+    from bmm.scan.schedule import reward_hours
+    from bmm.scan.venues.common import iso_ns
+
+    pm = asyncio.run(make("pm_us", fake_client).programs())[0]
+    assert pm.start_ns == iso_ns("2026-10-02T00:00:00Z") and pm.end_ns is None and pm.pool_usd == 36
+    assert reward_hours(pm, iso_ns("2026-10-04T00:00:00Z")) == pytest.approx(
+        24.0
+    )  # open-ended daily
+    k = asyncio.run(make("kalshi", fake_client).programs())[0]
+    assert (k.start_ns, k.end_ns) == (
+        iso_ns("2026-10-04T18:16:35.388521Z"),
+        iso_ns("2026-10-05T18:16:35.388521Z"),
+    )
+    assert reward_hours(k, iso_ns("2026-10-05T06:16:35.388521Z")) == pytest.approx(
+        12.0
+    )  # capped at time left
+    g = asyncio.run(make("gemini", fake_client).programs())[0]
+    assert g.end_ns == iso_ns("2026-10-06T01:30:00Z") or g.end_ns == iso_ns("2026-10-06T05:00:00Z")
+    assert reward_hours(g, g.end_ns - 3600 * 10**9) == pytest.approx(1.0)

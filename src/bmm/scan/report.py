@@ -23,6 +23,7 @@ from bmm.scan.allocator import N0, Alloc, Half, allocate, cost_hr, ev, s_star, s
 from bmm.scan.config import ScanConfig
 from bmm.scan.metrics import adverse_jump, calibrate_lambda
 from bmm.scan.models import Book, Level, Program, VenueAdapter
+from bmm.scan.schedule import is_open_ended, pool_remaining, reward_hours
 
 DOMAIN_CATS = {"metals", "energy", "rates", "fx", "equity_index"}
 BUDGET = 8000.0
@@ -108,6 +109,9 @@ def _default_adapters(conf: ScanConfig) -> dict[str, VenueAdapter]:
     return {n: ADAPTERS[n](None, c) for n, c in conf.venue.items() if n in ADAPTERS}
 
 
+MAX_ROC_DAY = 1.0  # a half-market returning more than 100% of collateral per day is a defect
+
+
 @dataclass
 class Analysis:
     date: str
@@ -117,9 +121,13 @@ class Analysis:
     markout: dict[str, tuple[float, str]] = field(default_factory=dict)  # key -> (m, source)
     flags: dict[str, list[str]] = field(default_factory=dict)
     stress_per: dict[str, float] = field(default_factory=dict)
+    fills: dict[str, float] = field(default_factory=dict)  # key -> fills/hr/side actually used
+    pools: dict[str, float] = field(default_factory=dict)  # key -> pool remaining $
     lam: float | None = None
     excluded: list[dict[str, Any]] = field(default_factory=list)
     blocked: list[tuple[str, str, str]] = field(default_factory=list)  # venue, market, reason
+    defects: list[dict[str, Any]] = field(default_factory=list)
+    eligible: set[str] = field(default_factory=set)  # half keys that entered allocation
     unknown_conc: int = 0
     standalone: dict[str, float] = field(default_factory=dict)  # "venue:market" -> net $/day at s*
     snaps: pl.DataFrame = field(default_factory=pl.DataFrame)
@@ -132,12 +140,22 @@ def _blocked_reason(conf: ScanConfig, venue: str) -> str | None:
     return None
 
 
+def _cap(h: Half) -> int:
+    cap = math.floor(MKT_CAP * BUDGET / h.coll + 1e-9) if h.coll > 0 else 0
+    if h.stress_per > 0:
+        cap = min(cap, math.floor(STRESS_MKT * BUDGET / h.stress_per + 1e-9))
+    return cap
+
+
 def analyze(
     date: str,
     root: Path = store.DEFAULT_ROOT,
     adapters: Mapping[str, Any] | None = None,
     conf: ScanConfig | None = None,
+    shares_factor: float = 1.0,
 ) -> Analysis | None:
+    """`shares_factor` scales fills estimated from sharesTraded: 1.0 = every contract counted once
+    (total/2 per side); 0.5 = both legs of a trade counted (total/4 per side)."""
     snaps_all = store.read("snapshots", date, root)
     if snaps_all.is_empty():
         return None
@@ -155,12 +173,13 @@ def analyze(
         named=True
     ):
         progs[(r["venue"], r["market_id"])] = Program(
-            **{k: r[k] for k in Program.__dataclass_fields__}
+            **{k: r[k] for k in Program.__dataclass_fields__ if k in r}
         )
 
     an = Analysis(date, snaps=snaps)
     cat_mean, overall = _cat_means(snaps)
     rows = list(snaps.iter_rows(named=True))
+    # lambda only from strong (non-weak) proxies: candle / price-history mids
     an.lam = calibrate_lambda(
         [
             (r["n_markout_proxied_side"], r["markout_proxied_side"], r["vol30_proxy"])
@@ -168,8 +187,10 @@ def analyze(
             if (r.get("n_markout_proxied_side") or 0) > 0
             and r.get("markout_proxied_side") is not None
             and r.get("vol30_proxy") is not None
+            and not r.get("weak_proxy")
         ]
     )
+    no_reward: set[tuple[str, str]] = set()
     for r in rows:
         k = (r["venue"], r["market_id"])
         if r["excluded"]:
@@ -179,6 +200,15 @@ def analyze(
             an.unknown_conc += 1
         ad, prog, book = adapters.get(r["venue"]), progs.get(k), books.get(k)
         if ad is None or prog is None or book is None:
+            continue
+        ts = int(r["ts_ns"])
+        hours24 = reward_hours(prog, ts)
+        if hours24 <= 0:
+            if k not in no_reward:
+                no_reward.add(k)
+                an.blocked.append(
+                    (r["venue"], r["market_id"], "no scheduled reward in the next 24h")
+                )
             continue
         side, cat = r["side"], r["category"]
         org_m, org_n = r["markout_30m_side"], r["n_markout_side"] or 0
@@ -194,13 +224,10 @@ def analyze(
         m, lb = shrink_markout(org_m, org_n, prior)
         w = min(org_n, N0) / N0 if org_m is not None else 0.0
         src = "organic" if w >= 1 else (f"blend:{psrc}" if w > 0 and psrc else psrc or "none")
+        shares = r.get("fills_shares_hr")
+        fills = shares / 2 * shares_factor if shares is not None else r["fills_side_hr"]
         c = cost_hr(
-            r["fills_side_hr"],
-            r["depth_raw_side"],
-            m,
-            r["maker_fee"],
-            r["maker_rebate"],
-            r["coll_side"],
+            fills, r["depth_raw_side"], m, r["maker_fee"], r["maker_rebate"], r["coll_side"]
         )
         px = r.get("bid") if side == "bid" else r.get("ask")
         if px is None:
@@ -221,44 +248,118 @@ def analyze(
             s_star_cf=ad.s_star_closed_form(prog, side, book, c),
             c_lower_bound=lb or bool(r.get("fills_lower_bound")),
             stress_per=sp,
+            hours24=hours24,
         )
         an.halves.append((h, r))
         an.info[key], an.markout[key], an.stress_per[key] = r, (m, src), sp
-        an.flags[key] = (
-            ["mk:proxied"]
-            if src.startswith(("proxied", "vol-proxy", "blend:proxied", "blend:vol-proxy"))
-            else []
-        ) + (["fills:proxied"] if r.get("fills_proxied") else [])
+        an.fills[key], an.pools[key] = fills, pool_remaining(prog, ts)
+        fl = []
+        if src.startswith(("proxied", "vol-proxy", "blend:proxied", "blend:vol-proxy")):
+            fl.append("mk:proxied")
+            if r.get("weak_proxy"):
+                fl.append("weak_proxy")
+        if r.get("fills_proxied"):
+            fl.append("fills:proxied")
+        if is_open_ended(prog):
+            fl.append("open_end")
+        if prog.schedule in ("", "[]"):
+            fl.append("no_schedule")
+        an.flags[key] = fl
 
     blocked_markets: set[tuple[str, str]] = set()
-    eligible: list[tuple[Half, dict[str, Any]]] = []
+    pre: list[tuple[Half, dict[str, Any]]] = []
     for h, r in an.halves:
         why = _blocked_reason(conf, h.venue)
         if why and (h.venue, r["market_id"]) not in blocked_markets:
             blocked_markets.add((h.venue, r["market_id"]))
             an.blocked.append((h.venue, r["market_id"], why))
         elif not why:
-            eligible.append((h, r))
+            pre.append((h, r))
+
+    # --- sanity guard: RoC > 100%/day or reward above the pool still to be paid = DEFECT ---
+    stats: dict[str, dict[str, float]] = {}
+    mkt_reward: defaultdict[str, float] = defaultdict(float)
+    for h, _ in pre:
+        s0 = s_star(h, _cap(h))
+        rd, cd, col = h.hours24 * h.reward(s0), h.hours24 * h.c * s0, s0 * h.coll
+        stats[h.key] = {
+            "s0": s0,
+            "rd": rd,
+            "cd": cd,
+            "col": col,
+            "roc": (rd - cd) / col if col > 0 else 0.0,
+        }
+        mkt_reward[h.market] += rd
+    defect_keys: set[str] = set()
+    for h, r in pre:
+        st, pool, reasons = stats[h.key], an.pools[h.key], []
+        if st["roc"] > MAX_ROC_DAY:
+            reasons.append(f"RoC {st['roc']:.0%}/day > {MAX_ROC_DAY:.0%}")
+        if mkt_reward[h.market] > pool * (1 + 1e-6) + 1e-9:
+            reasons.append(f"reward ${mkt_reward[h.market]:,.2f}/day > pool remaining ${pool:,.2f}")
+        if reasons:
+            defect_keys.add(h.key)
+            an.defects.append(
+                {"market": h.market, "key": h.key, "side": r["side"], "reasons": reasons,
+                 "inputs": {"R_side": r.get("R_side"), "hours24": h.hours24, "pool_remaining": pool,
+                            "D_side": r.get("D_side"), "c": h.c, "coll": h.coll, "s0": st["s0"],
+                            "reward_day": st["rd"], "cost_day": st["cd"], "roc": st["roc"],
+                            "markout": an.markout[h.key], "fills": an.fills[h.key],
+                            "flags": " ".join(an.flags[h.key])}}
+            )  # fmt: skip
+    eligible = [(h, r) for h, r in pre if h.key not in defect_keys]
+    an.eligible = {h.key for h, _ in eligible}
     an.allocs = {
         a.key: a
         for a in allocate(
-            [h for h, _ in eligible if not h.c_lower_bound],
-            BUDGET,
-            MKT_CAP,
-            stress_mkt_cap=STRESS_MKT,
-            stress_total_cap=STRESS_TOTAL,
-            bankroll=BUDGET,
+            [h for h, _ in eligible if not h.c_lower_bound], BUDGET, MKT_CAP,
+            stress_mkt_cap=STRESS_MKT, stress_total_cap=STRESS_TOTAL, bankroll=BUDGET,
         )
-    }
+    }  # fmt: skip
     for (
         h,
         _,
     ) in eligible:  # standalone potential (also for pending markets): drives the fast-tier ranking
-        cap = math.floor(MKT_CAP * BUDGET / h.coll + 1e-9) if h.coll > 0 else 0
-        if h.stress_per > 0:
-            cap = min(cap, math.floor(STRESS_MKT * BUDGET / h.stress_per + 1e-9))
-        an.standalone[h.market] = an.standalone.get(h.market, 0.0) + 24 * ev(h, s_star(h, cap))
+        an.standalone[h.market] = an.standalone.get(h.market, 0.0) + h.hours24 * ev(
+            h, s_star(h, _cap(h))
+        )
     return an
+
+
+def rank_markets(an: Analysis) -> list[tuple[str, float]]:
+    """Funded markets, best net return on collateral per day first (both sides combined)."""
+    g: defaultdict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+    for k, x in an.allocs.items():
+        if x.s > 0:
+            m = an.info[k]
+            g[f"{m['venue']}:{m['market_id']}"][0] += x.reward_day - x.cost_day
+            g[f"{m['venue']}:{m['market_id']}"][1] += x.collateral
+    return sorted(((m, v[0] / v[1]) for m, v in g.items()), key=lambda kv: (-kv[1], kv[0]))
+
+
+def sensitivity(
+    date: str,
+    root: Path = store.DEFAULT_ROOT,
+    adapters: Mapping[str, Any] | None = None,
+    conf: ScanConfig | None = None,
+    n: int = 10,
+) -> dict[str, Any]:
+    """Rank under both sharesTraded counting assumptions and say whether the top n changes."""
+    a, b = analyze(date, root, adapters, conf, 1.0), analyze(date, root, adapters, conf, 0.5)
+    ra = rank_markets(a) if a else []
+    rb = rank_markets(b) if b else []
+    top_a, top_b = [m for m, _ in ra[:n]], [m for m, _ in rb[:n]]
+    pos_a, pos_b = (
+        {m: i + 1 for i, (m, _) in enumerate(ra)},
+        {m: i + 1 for i, (m, _) in enumerate(rb)},
+    )
+    moved = [
+        {"market": m, "rank_a": pos_a.get(m), "rank_b": pos_b.get(m)}
+        for m in dict.fromkeys(top_a + top_b)
+        if pos_a.get(m) != pos_b.get(m)
+    ]
+    return {"top_a": top_a, "top_b": top_b, "changed": top_a != top_b, "moved": moved,
+            "entered": [m for m in top_b if m not in top_a], "left": [m for m in top_a if m not in top_b]}  # fmt: skip
 
 
 def refresh_ranking(
@@ -312,7 +413,7 @@ def build_report(
         return head + f"\nNo snapshots for {date}.\n"
     conf = conf or _load_conf()
     halves, allocs, info = an.halves, an.allocs, an.info
-    eligible_keys = {k for k in info if _blocked_reason(conf, info[k]["venue"]) is None}
+    eligible_keys = an.eligible
 
     # 1. top markets (both sides grouped)
     agg: dict[str, dict[str, Any]] = {}
@@ -433,7 +534,7 @@ def build_report(
                     "fl": set(),
                 },
             )
-            g["net"] += 24 * ev(h, s0)
+            g["net"] += h.hours24 * ev(h, s0)
             g["col"] += s0 * h.coll
             g["st"] += s0 * h.stress_per
             g["lb"] = g["lb"] or h.c_lower_bound
@@ -560,7 +661,68 @@ def build_report(
         + f"\n\nForecastEx renewed incentive program: **{fx.get('renewed_program', 'unknown')}** "
         f"(checked {fx.get('checked', '?')}, source: {fx.get('source', '[?]')})\n"
     )
-    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}"
+    s7 = (
+        "## 7. DEFECT half-markets\n\n"
+        f"DEFECT half-markets: {len(an.defects)}\n\n"
+        "A half-market is a DEFECT when its standalone return exceeds 100% of collateral per day or "
+        "its reward exceeds the pool still to be paid. Excluded from allocation; the inputs that "
+        "produced it are listed so the cause (scoring model, schedule, fills, collateral) can be found.\n\n"
+        + _table(
+            [
+                "market",
+                "side",
+                "reasons",
+                "R_side $/hr",
+                "hours24",
+                "pool_remaining $",
+                "D_side",
+                "c $/hr/contract",
+                "coll $",
+                "s0",
+                "reward $/day",
+                "cost $/day",
+                "RoC/day",
+                "markout (src)",
+                "fills/hr",
+                "flags",
+            ],
+            [
+                [
+                    d["market"],
+                    d["side"],
+                    "; ".join(d["reasons"]),
+                    i["R_side"],
+                    i["hours24"],
+                    i["pool_remaining"],
+                    i["D_side"],
+                    i["c"],
+                    i["coll"],
+                    i["s0"],
+                    i["reward_day"],
+                    i["cost_day"],
+                    i["roc"],
+                    f"{i['markout'][0]:.4f} ({i['markout'][1]})",
+                    i["fills"],
+                    i["flags"],
+                ]
+                for d in an.defects
+                for i in [d["inputs"]]
+            ],
+        )
+    )
+    sens = sensitivity(date, root, adapters, conf)
+    s8 = (
+        "## 8. sharesTraded counting sensitivity\n\n"
+        "Polymarket US fills come from cumulative `sharesTraded`. A: every contract counted once "
+        "(total/2 per side). B: both legs of a trade counted (total/4 per side). Top 10 under each:\n\n"
+        f"**Top 10 changes: {'YES' if sens['changed'] else 'no'}.** "
+        f"Entered under B: {', '.join(sens['entered']) or 'none'}; left: {', '.join(sens['left']) or 'none'}.\n\n"
+        + _table(
+            ["market", "rank A", "rank B"],
+            [[m["market"], m["rank_a"], m["rank_b"]] for m in sens["moved"]],
+        )
+    )
+    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}\n\n{s7}\n\n{s8}"
 
 
 def write_report(

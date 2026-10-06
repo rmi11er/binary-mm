@@ -12,7 +12,7 @@ import asyncio
 import dataclasses
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -114,6 +114,7 @@ class Ctx:
     trades: pl.DataFrame  # 8 days
     proxy: pl.DataFrame  # 8 days of backfilled mid series
     progs: pl.DataFrame  # 2 days of stored terms (fast tier)
+    cursors: pl.DataFrame = field(default_factory=pl.DataFrame)  # Kalshi backfill resume points
 
 
 def _meta_from_row(r: dict[str, Any]) -> MarketMeta:
@@ -140,8 +141,27 @@ async def _market_rows(
     book = await a.book(mkt)
     old = _sel(ctx.trades, a.name, mkt)
     last = int(old["ts_ns"].max()) if not old.is_empty() else 0  # type: ignore[arg-type]
-    since = max(now - BACKFILL_NS, last + 1) if last else now - BACKFILL_NS
-    new: list[Trade] = await a.trades(mkt, since)
+
+    # --- trades. Venues with a cursor-aware tape resume their 7-day backfill across scans. ---
+    resume = getattr(a, "trades_resume", None)
+    if callable(resume):
+        cur_rows = _sel(ctx.cursors, a.name, mkt)
+        stored_cur = (
+            str(cur_rows.sort("ts_ns")["cursor"][-1] or "") if not cur_rows.is_empty() else ""
+        )
+        if not last:  # first sight: newest pages of the 7d window
+            new, cursor_out = await resume(mkt, now - BACKFILL_NS, None)
+        else:
+            new, _ = await resume(mkt, last + 1, None)  # what is new since the last scan
+            cursor_out = stored_cur
+            if stored_cur and write_terms:  # older pages are fetched by the hourly tier only
+                older, cursor_out = await resume(mkt, now - BACKFILL_NS, stored_cur)
+                new = older + new
+        out["cursors"].append(
+            {"venue": a.name, "market_id": mkt, "cursor": cursor_out or "", "ts_ns": now}
+        )
+    else:
+        new = await a.trades(mkt, max(now - BACKFILL_NS, last + 1) if last else now - BACKFILL_NS)
     new_rows = [
         {"ts_ns": t.ts_ns, "venue": a.name, "market_id": mkt, "price": t.price, "size": t.size,
          "aggressor": t.aggressor}
@@ -161,10 +181,10 @@ async def _market_rows(
     )
     tr_24 = [t for t in trade_objs if t.ts_ns >= now - WINDOW_NS]
 
-    # --- proxy mid series: stored, else backfilled from the venue's history or its trade tape ---
+    # --- proxy mid series (stored, else backfilled) and where it came from ---
     stored = _sel(ctx.proxy, a.name, mkt)
     if not stored.is_empty():
-        source = str(stored["source"][0]) if "source" in stored.columns else "trade_derived"
+        source = str(stored["source"][0]) if "source" in stored.columns else "trade_buysell"
         fine = [
             (int(t), float(m))
             for t, m in stored.filter(pl.col("kind") == "fine").select("ts_ns", "mid").iter_rows()
@@ -174,16 +194,16 @@ async def _market_rows(
             for t, m in stored.filter(pl.col("kind") == "coarse").select("ts_ns", "mid").iter_rows()
         ]
     else:
-        fine, coarse, source = [], [], "trade_derived"
+        fine, coarse, source = [], [], "trade_buysell"
         hist_fn = getattr(a, "price_history", None)
         if callable(hist_fn):
             try:
                 fine, coarse = await hist_fn(mkt)
-                source = "price_history"
-            except VenueNotPublic as e:
-                log.warning("price history %s/%s unavailable: %s", a.name, mkt, e)
-        if not fine:
-            fine, source = resample_trades(trade_objs), "trade_derived"
+                source = getattr(a, "history_source", "price_history")
+            except (VenueNotPublic, KeyError, ValueError) as e:
+                log.warning("price history %s/%s unavailable: %r", a.name, mkt, e)
+        if not fine:  # weak fallback: average of last buy / last sell per bucket
+            fine, source = resample_trades(trade_objs), "trade_buysell"
         out["proxy_mids"] += [
             {"venue": a.name, "market_id": mkt, "ts_ns": t, "mid": m, "kind": k, "source": source}
             for k, ser in (("fine", fine), ("coarse", coarse))
@@ -202,10 +222,13 @@ async def _market_rows(
     proxy_df = pl.DataFrame(
         {"ts_ns": [t for t, _ in fine], "mid": [m for _, m in fine]}, schema=EMPTY_MIDS.schema
     )
-    union = pl.concat([org_mids, proxy_df]).unique("ts_ns", keep="first")
+    # The proxied prior may only use fills BEFORE our first organic snapshot, so it is independent
+    # of the organic estimate that later replaces it.
+    first_org = int(org["ts_ns"].min()) if not org.is_empty() else now + 1  # type: ignore[arg-type]
+    tr_pre = tr_all.filter(pl.col("ts_ns") < first_org) if not tr_all.is_empty() else tr_all
     vol30, _ = mean_abs_move(fine, MARKOUT_NS)
     p99 = tail_move_1h(
-        fine, coarse, fine_obs=len(trade_objs) if source == "trade_derived" else None
+        fine, coarse, fine_obs=len(trade_objs) if source == "trade_buysell" else None
     )
 
     # --- fills: tape where there is one, else estimated from sharesTraded ---
@@ -241,7 +264,7 @@ async def _market_rows(
         ):
             expr = SIDE_COLL_DEFAULT[side]
         m_org, n_org = markout_30m(tr_all, org_mids, s)
-        m_prox, n_prox = markout_30m(tr_all, union, s)
+        m_prox, n_prox = markout_30m(tr_pre, proxy_df, s)
         touch = (book.bids if s == "bid" else book.asks)[:1]
         fills = (
             (total_est or 0.0) / 2
@@ -259,10 +282,12 @@ async def _market_rows(
                 "spread": (ask - bid) if bid is not None and ask is not None else None,
                 "top_holder_share": touch[0].top_holder_share if touch else None,
                 "fills_side_hr": fills, "fills_proxied": use_shares,
+                "fills_shares_hr": total_est if use_shares else None,
                 "fills_lower_bound": (use_shares and total_est is None) or (no_tape and not use_shares),
                 "shares_traded": book.shares_traded,
                 "markout_30m_side": m_org, "n_markout_side": n_org,
                 "markout_proxied_side": m_prox, "n_markout_proxied_side": n_prox,
+                "mid_source": source, "weak_proxy": source == "trade_buysell",
                 "vol30_proxy": vol30, "jump_p99_1h": p99,
                 "n_trades_side": sum(1 for t in tr_24 if side_of(t, mid) == s),
                 "coll_side": eval_coll(str(expr), px), "coll_verified": verified,
@@ -274,7 +299,7 @@ async def _market_rows(
 
 
 def _program(row: dict[str, Any]) -> Program:
-    return Program(**{k: row[k] for k in Program.__dataclass_fields__})
+    return Program(**{k: row[k] for k in Program.__dataclass_fields__ if k in row})
 
 
 async def snapshot_once(
@@ -286,7 +311,7 @@ async def snapshot_once(
 ) -> dict[str, list[dict[str, Any]]]:
     """One pass. `only` = fast tier: just those (venue, market) pairs, from stored terms and meta."""
     out: dict[str, list[dict[str, Any]]] = {
-        k: [] for k in ("snapshots", "programs", "trades", "books", "proxy_mids")
+        k: [] for k in ("snapshots", "programs", "trades", "books", "proxy_mids", "cursors")
     }
     ctx = Ctx(
         _history("snapshots", now, root),
@@ -294,6 +319,7 @@ async def snapshot_once(
         _history("proxy_mids", now, root, days=8),
         _history("programs", now, root) if only is not None else pl.DataFrame(),
     )
+    ctx.cursors = _history("cursors", now, root, days=8)
     if ctx.trades.is_empty() is False:
         ctx.trades = ctx.trades.unique(subset=["venue", "market_id", "ts_ns", "price", "size"])
     stored_meta: dict[tuple[str, str], MarketMeta] = {}

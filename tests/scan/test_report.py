@@ -55,7 +55,7 @@ def seed(root, extra=()):
                     Program(
                         kw.get("venue", "v"),
                         m,
-                        12.0,
+                        6.0,
                         100.0,
                         0.05,
                         5.0,
@@ -176,7 +176,9 @@ def test_vol_proxy_uses_kalshi_calibrated_lambda(tmp_path):
     a = analyze(DATE, tmp_path, ADS, GEM)
     assert a.lam == pytest.approx(0.5)  # 40*0.02 / (40*0.04)
     assert a.markout["v:PM1:bid"] == (pytest.approx(-0.03), "vol-proxy")  # -lambda * 0.06
-    assert a.flags["v:PM1:bid"] == ["mk:proxied", "fills:proxied"]  # every derived input is flagged
+    assert {"mk:proxied", "fills:proxied"} <= set(
+        a.flags["v:PM1:bid"]
+    )  # every derived input is flagged
 
 
 def test_ranking_table_written_for_fast_tier(tmp_path):

@@ -19,6 +19,13 @@ ROUTES = {  # (substring of url, fixture) in match order
         ("/incentives", "pm_us/incentives.json"),
     ],
     "kalshi": [
+        (
+            "/candlesticks",
+            lambda params: (
+                f"kalshi/candles_{'1m' if params['period_interval'] == '1' else '60m'}.json"
+            ),
+        ),
+        ("/events/", "kalshi/event.json"),
         ("/orderbook", "kalshi/orderbook.json"),
         ("/markets/trades", "kalshi/trades.json"),
         ("/incentive_programs", "kalshi/incentive_programs.json"),

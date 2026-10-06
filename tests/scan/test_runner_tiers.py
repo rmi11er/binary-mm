@@ -35,7 +35,9 @@ class A:
         if not self.tape:
             return []
         # one fill a day for 7 days: sells hit our bid; mid drifts adversely 30m later
-        return [Trade(NOW - k * DAY, 0.49, 2.0, "sell") for k in range(1, 7)]
+        return [Trade(NOW - k * DAY, 0.49, 2.0, "sell") for k in range(1, 7)] + [
+            Trade(NOW - k * DAY + 60 * 10**9, 0.51, 1.0, "buy") for k in range(1, 7)
+        ]
 
     async def price_history(self, market_id):
         fine = [(NOW - DAY + i * 300 * 10**9, 0.5 + (0.1 if i > 140 else 0.0)) for i in range(288)]
@@ -52,7 +54,7 @@ def rows(out, side="bid"):
 def test_backfill_populates_proxied_fields_and_stores_series(tmp_path):
     out = asyncio.run(snapshot_once([A()], NOW, root=tmp_path))
     r = rows(out)
-    assert out["trades"] and len(out["trades"]) == 6  # 7d of tape fetched on first sight
+    assert out["trades"] and len(out["trades"]) == 12  # 7d of tape fetched on first sight
     assert out["proxy_mids"]  # series stored for later scans
     assert r["vol30_proxy"] is not None and r["vol30_proxy"] > 0
     assert r["jump_p99_1h"] is not None and r["jump_class"] == "high"
@@ -111,3 +113,67 @@ def test_venues_scan_concurrently(tmp_path):
     t0 = time.monotonic()
     asyncio.run(snapshot_once([a, b], NOW, root=tmp_path))
     assert time.monotonic() - t0 < 0.55  # two venues overlap instead of 0.6s serial
+
+
+def test_mid_source_and_weak_proxy_flag(tmp_path):
+    class NoHist(A):
+        price_history = None
+
+    weak = rows(asyncio.run(snapshot_once([NoHist()], NOW, root=tmp_path / "w")))
+    assert weak["mid_source"] == "trade_buysell" and weak["weak_proxy"] is True
+    strong = rows(asyncio.run(snapshot_once([A()], NOW, root=tmp_path / "s")))
+    assert strong["mid_source"] == "price_history" and strong["weak_proxy"] is False
+
+
+class Pre(A):
+    async def trades(self, market_id, since_ns):
+        return [
+            Trade(NOW - 3 * H_NS, 0.49, 2.0, "sell"),
+            Trade(NOW - 105 * 60 * 10**9, 0.49, 3.0, "sell"),
+        ]
+
+    async def price_history(self, market_id):
+        return [(NOW - DAY + i * 300 * 10**9, 0.45) for i in range(289)], []
+
+
+def test_proxied_prior_uses_only_fills_before_first_organic_snapshot(tmp_path):
+    first = {"ts_ns": NOW - 2 * H_NS, "venue": "v", "market_id": "m", "side": "bid", "mid": 0.5}
+    store.write("snapshots", [first], NOW - 2 * H_NS, tmp_path)
+    r = rows(asyncio.run(snapshot_once([Pre()], NOW, root=tmp_path)))
+    assert (
+        r["n_markout_proxied_side"] == 1
+    )  # only the fill 3h ago predates the first organic snapshot
+    assert r["markout_proxied_side"] == pytest.approx(0.45 - 0.49)
+    assert r["n_markout_side"] == 0
+
+
+class K(A):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    async def trades_resume(self, market_id, since_ns, cursor):
+        self.calls.append((since_ns, cursor))
+        if len(self.calls) == 1:
+            return [
+                Trade(NOW - DAY, 0.49, 1.0, "sell"),
+                Trade(NOW - 2 * H_NS, 0.49, 1.0, "sell"),
+            ], "c1"
+        return [], ""
+
+
+def test_kalshi_backfill_stores_cursor_and_resumes_incrementally(tmp_path):
+    k = K()
+    out = asyncio.run(snapshot_once([k], NOW, root=tmp_path))
+    assert out["cursors"] == [{"venue": "v", "market_id": "m", "cursor": "c1", "ts_ns": NOW}]
+    for t, rws in out.items():
+        store.write(t, rws, NOW, tmp_path)
+    k2 = K()
+    k2.calls = [(0, None)]  # make the fake return the "no more pages" answer from now on
+    later = NOW + H_NS
+    out2 = asyncio.run(snapshot_once([k2], later, root=tmp_path))
+    assert k2.calls[1:] == [
+        (NOW - 2 * H_NS + 1, None),
+        (later - 7 * DAY, "c1"),
+    ]  # newest first, then older pages
+    assert out2["cursors"][0]["cursor"] == ""  # finished: nothing to resume next time

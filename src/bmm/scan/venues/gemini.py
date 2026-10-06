@@ -10,6 +10,7 @@ from typing import Any
 from bmm.scan.config import VenueCfg
 from bmm.scan.http import GetOnlyClient
 from bmm.scan.models import Book, Level, MarketMeta, Program, Side, Trade
+from bmm.scan.schedule import make_schedule
 from bmm.scan.venues.common import (
     classify,
     digest,
@@ -45,7 +46,7 @@ class Gemini:
             raw.get("program_endpoint", f"{API}/v1/prediction-markets/liquidity-rewards/events"),
             {"limit": "100", "offset": "0"},
         )
-        cfg = await self._max_spread()
+        max_spread = await self._max_spread()
         out: dict[str, Program] = {}
         for ev in d["events"]:
             if len(out) >= cap:
@@ -59,22 +60,25 @@ class Gemini:
                 if raw.get("pool_scope") == "per_event"
                 else max(1, int(ev.get("pool_event_count", 1)))
             )
-            r = float(ev["daily_pool_usd"]) / 24.0 / shared / max(1, len(contracts))
+            pool = (
+                float(ev["daily_pool_usd"]) / shared / max(1, len(contracts))
+            )  # per contract per day
+            rate, end = pool / 24.0, iso_ns(ev.get("ends_at"))
             cat = classify(ev.get("category"), ev.get("title"))
-            cat = (
-                "sports"
-                if cat == "other"
+            if (
+                cat == "other"
                 and "sport" in (e.get("category", "") + ev.get("category", "")).lower()
-                else cat
-            )
+            ):
+                cat = "sports"
             for c in contracts:
                 sym = c["instrumentSymbol"]
                 out[sym] = Program(
-                    venue=self.name, market_id=sym, R_usd_hr=r, target_size=None, max_spread=cfg,
-                    venue_min=float(raw.get("min_size", 10)), discount=None,
+                    venue=self.name, market_id=sym, R_usd_hr=rate, target_size=None,
+                    max_spread=max_spread, venue_min=float(raw.get("min_size", 10)), discount=None,
                     scoring="quadratic_spread_two_sided_bonus", two_sided=False,
                     maker_fee=float(raw.get("maker_fee", 0.0)), maker_rebate=0.0,
-                    raw_hash=digest({"ev": ev, "c": c.get("instrumentSymbol")}),
+                    raw_hash=digest({"ev": ev, "c": sym}), start_ns=None, end_ns=end, pool_usd=pool,
+                    schedule=make_schedule([(None, end, rate)]),
                 )  # fmt: skip
                 self._meta[sym] = MarketMeta(
                     market_id=sym, title=f"{e.get('title', '')}: {c.get('label', '')}", category=cat,

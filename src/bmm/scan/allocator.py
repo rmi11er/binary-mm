@@ -32,6 +32,7 @@ class Half:
     s_star_cf: float | None = None  # closed-form optimum where the venue formula allows it
     c_lower_bound: bool = False
     stress_per: float = 0.0  # adverse jump $/contract on this side (see metrics.adverse_jump)
+    hours24: float = 24.0  # effective reward hours in the next 24h (schedule.reward_hours)
 
 
 @dataclass(frozen=True)
@@ -108,8 +109,8 @@ def s_star(h: Half, s_cap: int) -> int:
 
 
 def _alloc(h: Half, n: int) -> Alloc:
-    rd = 24 * h.reward(n) if n else 0.0
-    cd = 24 * h.c * n
+    rd = h.hours24 * h.reward(n) if n else 0.0
+    cd = h.hours24 * h.c * n
     col = n * h.coll
     return Alloc(
         h.key, n, rd, cd, col, (rd - cd) / col if col else 0.0, h.c_lower_bound, n * h.stress_per
@@ -185,7 +186,7 @@ def _greedy(halves: list[Half], caps: Caps) -> list[Alloc]:
             continue
         if not hs[0].two_sided and smax[hs[0].key] == 0:
             continue
-        bev = sum(ev(h, h.q) for h in hs)
+        bev = sum(ev(h, h.q) * h.hours24 for h in hs)
         bcoll = sum(h.q * h.coll for h in hs)
         if bev > 0:
             heapq.heappush(heap, (-bev / bcoll, next(seq), g, None))
@@ -218,6 +219,6 @@ def _greedy(halves: list[Half], caps: Caps) -> list[Alloc]:
         for k in add:
             h = by[k]
             if s[k] < smax[k]:
-                gain = (ev(h, s[k] + 1) - ev(h, s[k])) / h.coll
+                gain = h.hours24 * (ev(h, s[k] + 1) - ev(h, s[k])) / h.coll
                 heapq.heappush(heap, (-gain, next(seq), g, k))
     return [_alloc(h, s[h.key]) for h in halves]

@@ -9,6 +9,7 @@ from typing import Any
 from bmm.scan.config import VenueCfg
 from bmm.scan.http import GetOnlyClient
 from bmm.scan.models import Book, Level, MarketMeta, Program, Side, Trade
+from bmm.scan.schedule import make_schedule
 from bmm.scan.venues.common import (
     classify,
     digest,
@@ -38,40 +39,50 @@ class PmUs:
         d = await self.c.get_json(self.cfg.raw.get("program_endpoint", f"{GW}/v1/incentives"))
         out: list[Program] = []
         for row in d["programs"][: int(self.cfg.raw.get("max_markets", 100))]:
+            segs: list[tuple[int | None, int | None, float]] = []
+            cur: dict[str, Any] | None = None
             for tp in row.get("timePeriods", []):
-                if tp.get("status") != "active":
+                if tp.get("status") not in ("active", "upcoming", "scheduled", "pending"):
                     continue
-                start, end = iso_ns(tp.get("start")), iso_ns(tp.get("end"))
-                hours = (end - start) / 3.6e12 if start and end and end > start else 24.0
-                slug = row["marketSlug"]
-                out.append(
-                    Program(
-                        venue=self.name, market_id=slug,
-                        R_usd_hr=float(tp["rewardPool"]) / hours,
-                        target_size=float(tp["targetSize"]) if tp.get("targetSize") else None,
-                        max_spread=tp.get("maxSpread"),
-                        venue_min=float(self.cfg.raw.get("venue_min", 1.0)),
-                        discount=float(tp["discountFactor"]),
-                        scoring="geometric_target",
-                        two_sided=tp.get("maxSpread") is not None,
-                        maker_fee=float(self.cfg.raw.get("maker_fee", 0.0)),
-                        maker_rebate=float(self.cfg.raw.get("maker_rebate", 0.0)),
-                        raw_hash=digest(tp),
-                    )
-                )  # fmt: skip
-                cat = (
-                    "sports"
-                    if row.get("category") == "SPR"
-                    else classify(slug, row.get("subcategory"))
+                s0, e0 = iso_ns(tp.get("start")), iso_ns(tp.get("end"))
+                hrs = (
+                    (e0 - s0) / 3.6e12 if s0 and e0 and e0 > s0 else 24.0
+                )  # open end: a daily pool
+                segs.append((s0, e0, float(tp["rewardPool"]) / hrs))
+                if cur is None and tp.get("status") == "active":
+                    cur = tp
+            if cur is None:
+                continue
+            slug = row["marketSlug"]
+            start, end = iso_ns(cur.get("start")), iso_ns(cur.get("end"))
+            hours = (end - start) / 3.6e12 if start and end and end > start else 24.0
+            out.append(
+                Program(
+                    venue=self.name, market_id=slug,
+                    R_usd_hr=float(cur["rewardPool"]) / hours,
+                    target_size=float(cur["targetSize"]) if cur.get("targetSize") else None,
+                    max_spread=cur.get("maxSpread"),
+                    venue_min=float(self.cfg.raw.get("venue_min", 1.0)),
+                    discount=float(cur["discountFactor"]),
+                    scoring="geometric_target",
+                    two_sided=cur.get("maxSpread") is not None,
+                    maker_fee=float(self.cfg.raw.get("maker_fee", 0.0)),
+                    maker_rebate=float(self.cfg.raw.get("maker_rebate", 0.0)),
+                    raw_hash=digest(cur),
+                    start_ns=start, end_ns=end, pool_usd=float(cur["rewardPool"]),
+                    schedule=make_schedule(segs),
                 )
-                self._meta[slug] = MarketMeta(
-                    market_id=slug, title=slug, category=cat, expiry_ns=None,
-                    settle_source=None, settle_ns=None,
-                    reference_quality=reference_quality(cat),
-                    in_game=tp.get("period") == "live",
-                    jump_class=jump_class(cat, slug, row.get("subcategory")),
-                )  # fmt: skip
-                break
+            )  # fmt: skip
+            cat = (
+                "sports" if row.get("category") == "SPR" else classify(slug, row.get("subcategory"))
+            )
+            self._meta[slug] = MarketMeta(
+                market_id=slug, title=slug, category=cat, expiry_ns=None,
+                settle_source=None, settle_ns=None,
+                reference_quality=reference_quality(cat),
+                in_game=cur.get("period") == "live",
+                jump_class=jump_class(cat, slug, row.get("subcategory")),
+            )  # fmt: skip
         return out
 
     async def meta(self, market_id: str) -> MarketMeta:
