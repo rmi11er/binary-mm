@@ -34,6 +34,9 @@ class Program:
     end_ns: int | None = None  # current period end (None = open-ended)
     pool_usd: float = 0.0  # pool of the current period
     schedule: str = "[]"  # JSON [[start|null, end|null, usd_per_hr], ...]; see schedule.py
+    stream_windows: int = (
+        0  # >= 3: one of a recurring series of short windows (see kalshi.programs)
+    )
 
 
 @dataclass(frozen=True)

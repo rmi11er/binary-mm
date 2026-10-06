@@ -37,10 +37,55 @@ NEWS_DRIVEN = re.compile(
 DOMAIN_CATS = {"metals", "energy", "rates", "fx", "equity_index"}
 
 
+_METALS_TICKER = re.compile(
+    r"^(?:KX)?(?:GOLD|SILVER|COPPER|PLATINUM|PALLADIUM)(?:15M|H|D|W|MON|EOY|EOM)?(?:-|$)"
+)  # price series only: KXGOLDCARD, KXCOPPEROPEN, KXGOLDENBACHELOR do not match
+_METAL_WORD = re.compile(r"\b(gold|silver|copper|platinum|palladium)\b")
+_METAL_CONTEXT = re.compile(
+    r"\b(price|prices|close|closes|above|below|settle|settles|range|how high|how low|hourly|daily|weekly"
+    r"|monthly|15-minute|15 minute|per ounce|per pound|futures|up|down|higher|lower)\b"
+)
+_METAL_NEG = re.compile(
+    r"\b(cup|card|cards|bachelor|mountain|cable|tariff|tariffs|withdrawals?|vs\.?|versus|medal|rush|coast"
+    r"|glove|gloves|standard|record|album|ring|jewelry)\b"
+)
+_TICKER_RULES = [
+    ("metals", _METALS_TICKER),
+    ("fx", re.compile(r"^KX(?:(?:USD|EUR|JPY|GBP|AUD|CAD|CHF|NZD|CNH)){2}|^KXFX")),
+    ("energy", re.compile(r"^KX(?:WTI|BRENT|OIL|NATGAS|CRUDE|GASOLINE|HENRYHUB|AAAGAS)")),
+    (
+        "rates",
+        re.compile(r"^KX(?:FED|FOMC|CPI|TNOTE|TBILL|TREASURY|SOFR|RATECUT|RATEHIKE|YIELD|10Y|2Y)"),
+    ),
+    ("equity_index", re.compile(r"^KX(?:INX|NASDAQ|NDX|SPX|SP500|DOW|RUSSELL|RUT)")),
+]
+
+
+def ticker_category(ticker: str) -> str | None:
+    """Domain category from a venue ticker alone (cheap, used to triage before any fetch)."""
+    t = ticker.upper()
+    return next((cat for cat, pat in _TICKER_RULES if pat.match(t)), None)
+
+
+def _is_metals(texts: tuple[str | None, ...]) -> bool:
+    for t in texts:
+        if t and " " not in t.strip() and _METALS_TICKER.match(t.strip().upper()):
+            return True
+    blob = " ".join(t for t in texts if t and " " in t.strip()).lower()  # free-text titles only
+    return bool(
+        blob
+        and _METAL_WORD.search(blob)
+        and _METAL_CONTEXT.search(blob)
+        and not _METAL_NEG.search(blob)
+    )
+
+
 def classify(*texts: str | None) -> str:
+    if _is_metals(texts):
+        return "metals"
     blob = " ".join(t for t in texts if t).lower()
     for cat, pat in DOMAIN_KEYWORDS.items():
-        if re.search(pat, blob):
+        if cat != "metals" and re.search(pat, blob):
             return cat
     return "other"
 

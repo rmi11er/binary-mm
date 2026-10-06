@@ -4,14 +4,16 @@ so asks are derived from the NO bids."""
 from __future__ import annotations
 
 import bisect
+import statistics
 from typing import Any
 
 from bmm.clock import now_ns
 from bmm.scan.config import VenueCfg
 from bmm.scan.http import GetOnlyClient
 from bmm.scan.models import Book, Level, MarketMeta, Program, Side, Trade, VenueNotPublic
-from bmm.scan.schedule import make_schedule
+from bmm.scan.schedule import H_NS, make_schedule, reward_hours
 from bmm.scan.venues.common import (
+    DOMAIN_CATS,
     classify,
     digest,
     geo_walk,
@@ -21,6 +23,7 @@ from bmm.scan.venues.common import (
     pro_rata,
     qualifying,
     reference_quality,
+    ticker_category,
 )
 
 API = "https://external-api.kalshi.com/trade-api/v2"
@@ -43,6 +46,7 @@ def _grid(
 
 class Kalshi:
     name = "kalshi"
+    _now = staticmethod(now_ns)  # injectable clock (tests)
 
     def __init__(self, client: GetOnlyClient, cfg: VenueCfg) -> None:
         self.c, self.cfg = client, cfg
@@ -53,36 +57,99 @@ class Kalshi:
     def _side(self, prog: Program) -> float:
         return prog.R_usd_hr * float(self.cfg.raw.get("side_split", 0.5))
 
+    async def _fetch_all(self, status: str) -> list[dict[str, Any]]:
+        """Every program of a status, following next_cursor; stops on a page with no new ids."""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cur = ""
+        for _ in range(int(self.cfg.raw.get("program_pages", 25))):
+            params = {"status": status, "type": "liquidity", "limit": "200"}
+            if cur:
+                params["cursor"] = cur
+            d = await self.c.get_json(
+                self.cfg.raw.get("program_endpoint", f"{API}/incentive_programs"), params
+            )
+            new = [p for p in d.get("incentive_programs", []) if p["id"] not in seen]
+            if not new:
+                break
+            seen.update(p["id"] for p in new)
+            rows += new
+            cur = d.get("next_cursor") or ""
+            if not cur:
+                break
+        return rows
+
     async def programs(self) -> list[Program]:
-        d = await self.c.get_json(
-            self.cfg.raw.get("program_endpoint", f"{API}/incentive_programs"),
-            {"status": "active", "type": "liquidity"},
-        )
-        out: list[Program] = []
-        for p in d["incentive_programs"][: int(self.cfg.raw.get("max_markets", 100))]:
+        """Active programs, triaged for fetching: metals/FX/energy/rates/equity-index series first, then
+        pool $/day descending, capped at max_markets (the per-host pacing budget).
+
+        A series of recurring short windows (>= 3 windows within the next 24h, median <= 1h, e.g. the
+        15-minute metals markets) is a STREAM: each program's schedule holds every window of the series,
+        so $/day = the sum of the scheduled windows' pools while collateral stays the per-window
+        requirement. Windows sharing a start time (several strikes) count once, at the median pool."""
+        active = await self._fetch_all("active")
+        ids = {p["id"] for p in active}
+        upcoming = [p for p in await self._fetch_all("upcoming") if p["id"] not in ids]
+        now = self._now()
+        horizon = now + 24 * H_NS
+
+        def parse(p: dict[str, Any]) -> dict[str, Any] | None:
             start, end = iso_ns(p["start_date"]), iso_ns(p["end_date"])
             if not start or not end or end <= start:
-                continue
-            pool = float(p["period_reward"]) / 1e4  # centi-cents -> USD
-            rate = pool / ((end - start) / 3.6e12)
+                return None
+            return {"p": p, "ticker": p["market_ticker"], "series": p["market_ticker"].split("-")[0],
+                    "start": start, "end": end, "pool": float(p["period_reward"]) / 1e4}  # fmt: skip
+
+        parsed = [x for x in (parse(p) for p in active) if x]
+        by_win: dict[str, dict[int, list[tuple[int, float]]]] = {}
+        for x in [*parsed, *(y for y in (parse(p) for p in upcoming) if y)]:
+            by_win.setdefault(x["series"], {}).setdefault(x["start"], []).append(
+                (x["end"], x["pool"])
+            )
+        series_windows: dict[str, list[tuple[int, int, float]]] = {}
+        for ser, ws in by_win.items():
+            segs = []
+            for st, lst in sorted(ws.items()):
+                if st > horizon:
+                    continue
+                end = max(e for e, _ in lst)
+                segs.append(
+                    (st, end, statistics.median(pl_ for _, pl_ in lst) / ((end - st) / H_NS))
+                )
+            series_windows[ser] = segs
+        out: list[Program] = []
+        for x in parsed:
+            p = x["p"]
+            rate = x["pool"] / ((x["end"] - x["start"]) / H_NS)
+            segs = [(x["start"], x["end"], rate)]
+            n = 0
+            sw = series_windows.get(x["series"], [])
+            if len(sw) >= 3 and statistics.median(e - s for s, e, _ in sw) <= H_NS:
+                segs, n = list(sw), len(sw)
             out.append(
                 Program(
-                    venue=self.name, market_id=p["market_ticker"], R_usd_hr=rate,
+                    venue=self.name, market_id=x["ticker"], R_usd_hr=rate,
                     target_size=float(p["target_size_fp"]), max_spread=None,
                     venue_min=float(self.cfg.raw.get("venue_min", 1.0)),
                     discount=float(p["discount_factor_bps"]) / 1e4,
                     scoring="geometric_target", two_sided=True,
                     maker_fee=float(self.cfg.raw.get("maker_fee", 0.0)),
                     maker_rebate=float(self.cfg.raw.get("maker_rebate", 0.0)),
-                    raw_hash=digest(p), start_ns=start, end_ns=end, pool_usd=pool,
-                    schedule=make_schedule([(start, end, rate)]),
+                    raw_hash=digest(p), start_ns=x["start"], end_ns=x["end"], pool_usd=x["pool"],
+                    schedule=make_schedule(segs), stream_windows=n,
                 )
             )  # fmt: skip
-        return out
+
+        def key(prog: Program) -> tuple[int, float, str]:
+            dom = ticker_category(prog.market_id) in DOMAIN_CATS
+            return (0 if dom else 1, -prog.R_usd_hr * reward_hours(prog, now), prog.market_id)
+
+        out.sort(key=key)
+        return out[: int(self.cfg.raw.get("max_markets", 100))]
 
     async def meta(self, market_id: str) -> MarketMeta:
         m: dict[str, Any] = (await self.c.get_json(f"{API}/markets/{market_id}"))["market"]
-        cat = classify(m.get("title"), market_id, m.get("rules_primary"))
+        cat = ticker_category(market_id) or classify(m.get("title"), market_id)
         exp = iso_ns(m.get("expected_expiration_time") or m.get("close_time"))
         return MarketMeta(
             market_id=market_id, title=m.get("title", market_id), category=cat, expiry_ns=exp,

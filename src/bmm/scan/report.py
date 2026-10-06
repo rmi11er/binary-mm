@@ -130,6 +130,19 @@ class Analysis:
     excluded: list[dict[str, Any]] = field(default_factory=list)
     blocked: list[tuple[str, str, str]] = field(default_factory=list)  # venue, market, reason
     defects: list[dict[str, Any]] = field(default_factory=list)
+    review: list[dict[str, Any]] = field(
+        default_factory=list
+    )  # needs_review_recurring (not DEFECT)
+    stats: dict[str, dict[str, float]] = field(
+        default_factory=dict
+    )  # standalone s0 economics per half
+    period_h: dict[str, float | None] = field(default_factory=dict)
+    stream: dict[str, int] = field(
+        default_factory=dict
+    )  # windows in the recurring stream (0 = not a stream)
+    pool_win: dict[str, float] = field(default_factory=dict)
+    hours24: dict[str, float] = field(default_factory=dict)
+    status: dict[str, str] = field(default_factory=dict)
     over_at_alloc: list[dict[str, Any]] = field(
         default_factory=list
     )  # RoC > 100%/day at the allocated size
@@ -259,6 +272,14 @@ def analyze(
         an.halves.append((h, r))
         an.info[key], an.markout[key], an.stress_per[key] = r, (m, src), sp
         an.fills[key], an.pools[key] = fills, pool_remaining(prog, ts)
+        an.stream[key], an.hours24[key], an.pool_win[key] = (
+            prog.stream_windows,
+            hours24,
+            prog.pool_usd,
+        )
+        an.period_h[key] = (
+            (prog.end_ns - prog.start_ns) / 3.6e12 if prog.end_ns and prog.start_ns else None
+        )
         fl = []
         if src.startswith(("proxied", "vol-proxy", "blend:proxied", "blend:vol-proxy")):
             fl.append("mk:proxied")
@@ -299,26 +320,48 @@ def analyze(
                         "roc_active": roc * max(1.0, 24.0 / h.hours24)}  # fmt: skip
         mkt_reward[h.market] += rd
     defect_keys: set[str] = set()
+    an.stats = stats
     for h, r in guarded:
-        st, pool, reasons = stats[h.key], an.pools[h.key], []
+        st, pool = stats[h.key], an.pools[h.key]
+        structural: list[str] = []
+        roc_reasons: list[str] = []
         if h.coll <= 0:
-            reasons.append("collateral per contract <= 0")
+            structural.append("collateral per contract <= 0")
         if st["roc_active"] > MAX_ROC_DAY:
-            reasons.append(
+            roc_reasons.append(
                 f"RoC {st['roc_active']:.0%}/day (per active hour, scaled to 24h) > {MAX_ROC_DAY:.0%}"
             )
         if mkt_reward[h.market] > pool * (1 + 1e-6) + 1e-9:
-            reasons.append(f"reward ${mkt_reward[h.market]:,.2f}/day > pool remaining ${pool:,.2f}")
-        if reasons:
-            defect_keys.add(h.key)
-            an.defects.append(
-                {"market": h.market, "key": h.key, "side": r["side"], "reasons": reasons,
-                 "inputs": {"R_side": r.get("R_side"), "hours24": h.hours24, "pool_remaining": pool,
-                            "D_side": r.get("D_side"), "c": h.c, "coll": h.coll, "s0": st["s0"],
-                            "reward_day": st["rd"], "cost_day": st["cd"], "roc": st["roc_active"],
-                            "markout": an.markout[h.key], "fills": an.fills[h.key],
-                            "flags": " ".join(an.flags[h.key])}}
-            )  # fmt: skip
+            structural.append(
+                f"reward ${mkt_reward[h.market]:,.2f}/day > pool remaining ${pool:,.2f}"
+            )
+        if not (structural or roc_reasons):
+            continue
+        n_win = an.stream[h.key]
+        if n_win >= 3 and roc_reasons and not structural:
+            bucket = an.review
+            reasons = [
+                (
+                    f"RoC {st['roc_active']:.0%}/day on per-window collateral > {MAX_ROC_DAY:.0%} "
+                    f"(recurring stream of {n_win} windows: $/day is the sum of scheduled pools, collateral is reused)"
+                )
+            ]
+        else:
+            bucket, reasons = an.defects, structural + roc_reasons
+        defect_keys.add(h.key)
+        ph = an.period_h.get(h.key)
+        win24 = h.hours24 / ph if ph else None
+        net = st["rd"] - st["cd"]
+        bucket.append(
+            {"market": h.market, "key": h.key, "side": r["side"], "reasons": reasons,
+             "inputs": {"R_side": r.get("R_side"), "hours24": h.hours24, "pool_remaining": pool,
+                        "D_side": r.get("D_side"), "c": h.c, "coll": h.coll, "s0": st["s0"],
+                        "reward_day": st["rd"], "cost_day": st["cd"], "roc": st["roc_active"],
+                        "markout": an.markout[h.key], "fills": an.fills[h.key],
+                        "flags": " ".join(an.flags[h.key]), "windows": n_win,
+                        "pool_window": an.pool_win[h.key], "windows_24h": win24,
+                        "roc_window": net / win24 / st["col"] if win24 and st["col"] > 0 else None}}
+        )  # fmt: skip
     eligible = [(h, r) for h, r in pre if h.key not in defect_keys]
     an.eligible = {h.key for h, _ in eligible}
     an.allocs = {
@@ -348,6 +391,22 @@ def analyze(
         an.standalone[h.market] = an.standalone.get(h.market, 0.0) + h.hours24 * ev(
             h, s_star(h, _cap(h))
         )
+    review_keys, defect_k, pre_keys = (
+        {d["key"] for d in an.review},
+        {d["key"] for d in an.defects},
+        {h.key for h, _ in pre},
+    )
+    for h, _ in an.halves:
+        k = h.key
+        a_ = an.allocs.get(k)
+        an.status[k] = (
+            "needs_review_recurring" if k in review_keys
+            else "DEFECT" if k in defect_k
+            else "not_allocated" if k not in pre_keys
+            else "pending_markouts" if h.c_lower_bound
+            else "allocated" if a_ is not None and a_.s > 0
+            else "not_funded"
+        )  # fmt: skip
     return an
 
 
@@ -749,6 +808,124 @@ def build_report(
             ],
         )
     )
+
+    def _rev_row(d: dict[str, Any]) -> list[Any]:
+        x = d["inputs"]
+        return [d["market"], d["side"], "; ".join(d["reasons"]), x["windows"], x["pool_window"], x["pool_remaining"],
+                x["R_side"], x["hours24"], x["D_side"], x["c"], x["coll"], x["s0"], x["reward_day"], x["cost_day"],
+                x["roc"], x["roc_window"], f"{x['markout'][0]:.4f} ({x['markout'][1]})", x["fills"], x["flags"]]  # fmt: skip
+
+    s7b = (
+        "## 7b. needs_review_recurring\n\n"
+        f"needs_review_recurring half-markets: {len(an.review)}\n\n"
+        "Recurring short-window programs (the current window plus the upcoming windows of the same series, each "
+        "a new market) whose return on per-window collateral exceeds 100%/day. Not DEFECT: $/day is the sum of the "
+        "scheduled windows' pools over the next 24h and the collateral is the per-window requirement, reused across "
+        "windows, so a high figure is expected for a stream. Held out of allocation until adverse selection on these "
+        "short-lived markets can be measured; listed with the inputs.\n\n"
+        + _table(
+            [
+                "market",
+                "side",
+                "reasons",
+                "windows",
+                "pool/window $",
+                "pool_remaining $",
+                "R_side $/hr",
+                "hours24",
+                "D_side",
+                "c $/hr/contract",
+                "coll $ (per window)",
+                "s0",
+                "reward $/day",
+                "cost $/day",
+                "RoC/day",
+                "RoC/window",
+                "markout (src)",
+                "fills/hr",
+                "flags",
+            ],
+            [_rev_row(d) for d in an.review],
+        )
+    )
+    metals: defaultdict[str, list[str]] = defaultdict(list)
+    for k_, r_ in info.items():
+        if r_["category"] == "metals":
+            metals[f"{r_['venue']}:{r_['market_id']}"].append(k_)
+    m_rows: list[list[Any]] = []
+    m_other: list[str] = []
+    for m_, keys in sorted(metals.items()):
+        k0 = keys[0]
+        ph, n_win = an.period_h.get(k0), an.stream[k0]
+        if not (n_win >= 3 or (ph is not None and ph <= 1.0)):
+            m_other.append(m_)
+            continue
+        sz: dict[str, float] = {}
+        rd = cd = col = stl = 0.0
+        for k_ in keys:
+            al = allocs.get(k_)
+            if al is not None and al.s > 0:
+                sz[info[k_]["side"]], rd, cd, col, stl = (
+                    al.s,
+                    rd + al.reward_day,
+                    cd + al.cost_day,
+                    col + al.collateral,
+                    stl + al.stress_loss,
+                )
+            elif k_ in an.stats:
+                x = an.stats[k_]
+                sz[info[k_]["side"]], rd, cd, col, stl = (
+                    x["s0"],
+                    rd + x["rd"],
+                    cd + x["cd"],
+                    col + x["col"],
+                    stl + x["s0"] * an.stress_per[k_],
+                )
+        roc = (rd - cd) / col if col > 0 else None
+        win24 = an.hours24[k0] / ph if ph else None
+        mk = sorted({an.markout[k_][1] for k_ in keys})
+        r0 = info[k0]
+        m_rows.append(
+            [m_, m_.split(":", 1)[1].split("-")[0], "/".join(sorted({an.status[k_] for k_ in keys})), ph, n_win,
+             an.pool_win[k0], an.pools[k0], r0.get("target_size"), r0.get("discount"), sz.get("bid"), sz.get("ask"),
+             rd, cd, col, roc, roc / win24 if roc is not None and win24 else None, stl, "/".join(mk),
+             " ".join(sorted({f for k_ in keys for f in an.flags[k_]}))]
+        )  # fmt: skip
+    s9 = (
+        "## 9. Metals 15-minute streams\n\n"
+        "Metals programs that are recurring short windows (the 15-minute copper/palladium/platinum/gold series). "
+        "$/day = the sum of the scheduled windows' pools over the next 24h; collateral = the per-window requirement, "
+        "reused across windows; RoC/window = RoC/day / windows in 24h. Sizes are the allocated size, or the "
+        "standalone s* for markets held out (status column).\n\n"
+        + _table(
+            [
+                "market",
+                "series",
+                "status",
+                "period h",
+                "windows",
+                "pool/window $",
+                "pool_remaining $",
+                "target",
+                "discount",
+                "s_bid",
+                "s_ask",
+                "reward $/day",
+                "cost $/day",
+                "collateral $ (per window)",
+                "RoC/day",
+                "RoC/window",
+                "stress $",
+                "markout src",
+                "flags",
+            ],
+            m_rows,
+        )
+        + f"\n\nMetals programs with a period > 1h this scan: {len(m_other)}"
+        + (f" ({', '.join(m_other)})" if m_other else "")
+        + ("" if metals else ". No metals programs were scanned.")
+        + "\n"
+    )
     sens = sensitivity(date, root, adapters, conf)
     s8 = (
         "## 8. sharesTraded counting sensitivity\n\n"
@@ -761,7 +938,7 @@ def build_report(
             [[m["market"], m["rank_a"], m["rank_b"]] for m in sens["moved"]],
         )
     )
-    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}\n\n{s7}\n\n{s8}\n\n{quality_section(date, root)}"
+    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}\n\n{s7}\n\n{s7b}\n\n{s8}\n\n{s9}\n\n{quality_section(date, root)}"
 
 
 def quality_stats(date: str, root: Path = store.DEFAULT_ROOT) -> dict[str, Any]:
@@ -807,7 +984,7 @@ def quality_stats(date: str, root: Path = store.DEFAULT_ROOT) -> dict[str, Any]:
 
 def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -> str:
     q = quality_stats(date, root)
-    s = "## 9. Quote quality (staleness, requote cadence, D churn)\n\n"
+    s = "## 10. Quote quality (staleness, requote cadence, D churn)\n\n"
     if q["stale"]:
         ranked = sorted(q["stale"].items(), key=lambda kv: (-kv[1]["stale_pct"], kv[0]))[:top]
         s += (

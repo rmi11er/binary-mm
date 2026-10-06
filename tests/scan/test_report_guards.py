@@ -167,3 +167,54 @@ def test_budget_limited_small_size_is_listed_not_excluded(tmp_path):
     assert a.over_at_alloc and all(o["roc"] > 1.0 for o in a.over_at_alloc)
     assert sum(1 for x in a.allocs.values() if x.s > 0) > 0  # still allocated
     assert "Allocated above 100%/day" in build_report(DATE, tmp_path, adapters=ADS, conf=GEM)
+
+
+MINUTE = 60 * 10**9
+
+
+def stream_pk(rate=80.0, windows=100, pool=None):
+    segs = [(TS + i * 15 * MINUTE, TS + (i + 1) * 15 * MINUTE, rate) for i in range(windows)]
+    return {"R_usd_hr": rate, "schedule": make_schedule(segs), "stream_windows": windows,
+            "start_ns": TS, "end_ns": TS + 15 * MINUTE, "pool_usd": rate / 4}  # fmt: skip
+
+
+def test_high_return_recurring_stream_is_needs_review_not_defect(tmp_path):
+    seed2(tmp_path, [("STREAM", {}, stream_pk()), ("PLAIN", {}, {"R_usd_hr": 80.0})])
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert {d["market"] for d in a.defects} == {"v:PLAIN"}  # same return, not a stream -> DEFECT
+    assert {d["market"] for d in a.review} == {"v:STREAM"}  # recurring windows -> review class
+    assert all(any("recurring" in r for r in d["reasons"]) for d in a.review)
+    assert not any("STREAM" in k and x.s > 0 for k, x in a.allocs.items())  # held out of allocation
+    md = build_report(DATE, tmp_path, adapters=ADS, conf=GEM)
+    assert "needs_review_recurring" in md and "## 7b." in md
+    assert "DEFECT half-markets: 2" in md  # PLAIN's two halves only; review items are not counted
+
+
+def test_sane_stream_is_allocated_and_reuses_collateral_across_windows(tmp_path):
+    seed2(tmp_path, [("SANE", {}, stream_pk(rate=6.0)), ("ONE", {}, {})])
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert not a.review and not a.defects
+    s, o = a.allocs["v:SANE:bid"], a.allocs["v:ONE:bid"]
+    assert s.s == o.s > 0 and s.collateral == pytest.approx(
+        o.collateral
+    )  # per-window requirement, reused
+    assert s.reward_day == pytest.approx(o.reward_day)  # 24 effective hours either way
+
+
+def test_pool_breach_on_a_stream_is_still_a_defect(tmp_path):
+    seed2(tmp_path, [("STREAM", {}, stream_pk(rate=6.0))])
+    a = analyze(DATE, tmp_path, {"v": BadStub()}, GEM)
+    assert a.defects and not a.review
+
+
+def test_metals_section_lists_streams_with_status_and_other_metals_programs(tmp_path):
+    seed2(tmp_path, [
+        ("KXPALLADIUM15M-X", {"category": "metals"}, stream_pk()),
+        ("KXSILVERD-Y", {"category": "metals"}, {"R_usd_hr": 1.0, "start_ns": TS, "end_ns": TS + 24 * 60 * MINUTE}),
+        ("KXUSDJPY15M-Z", {"category": "fx"}, stream_pk()),
+    ])  # fmt: skip
+    md = build_report(DATE, tmp_path, adapters=ADS, conf=GEM)
+    sec = md.split("## 9. Metals 15-minute streams")[1].split("## 10.")[0]
+    assert "KXPALLADIUM15M-X" in sec and "needs_review_recurring" in sec
+    assert "KXUSDJPY15M-Z" not in sec  # not metals
+    assert "Metals programs with a period > 1h this scan: 1" in sec and "KXSILVERD-Y" in sec
