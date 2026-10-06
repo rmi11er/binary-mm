@@ -37,27 +37,45 @@ NEWS_DRIVEN = re.compile(
 DOMAIN_CATS = {"metals", "energy", "rates", "fx", "equity_index"}
 
 
+_FREQ = r"(?:15M|H|D|W|MON|EOY|EOM|MAX|MIN|Y)?"
 _METALS_TICKER = re.compile(
-    r"^(?:KX)?(?:GOLD|SILVER|COPPER|PLATINUM|PALLADIUM)(?:15M|H|D|W|MON|EOY|EOM)?(?:-|$)"
-)  # price series only: KXGOLDCARD, KXCOPPEROPEN, KXGOLDENBACHELOR do not match
+    r"^(?:KX)?(?:GOLD|SILVER|COPPER|PLATINUM|PALLADIUM)" + _FREQ + r"(?:-|$)"
+)
+# price series only: KXGOLDCARD, KXCOPPEROPEN, KXGOLDENBACHELOR do not match
 _METAL_WORD = re.compile(r"\b(gold|silver|copper|platinum|palladium)\b")
 _METAL_CONTEXT = re.compile(
-    r"\b(price|prices|close|closes|above|below|settle|settles|range|how high|how low|hourly|daily|weekly"
-    r"|monthly|15-minute|15 minute|per ounce|per pound|futures|up|down|higher|lower)\b"
+    r"\b(price|prices|close|closes|above|below|settle|settles|range|how high|how low|hit|hits|reach|hourly|daily"
+    r"|weekly|monthly|15-minute|15 minute|per ounce|per pound|ounce|oz|futures|higher|lower)\b|\$"
 )
 _METAL_NEG = re.compile(
-    r"\b(cup|card|cards|bachelor|mountain|cable|tariff|tariffs|withdrawals?|vs\.?|versus|medal|rush|coast"
-    r"|glove|gloves|standard|record|album|ring|jewelry)\b"
+    r"\b(cup|card|cards|bachelor|mountain|cable|withdrawals?|vs\.?|versus|medal|rush|coast|glove|gloves|standard"
+    r"|album|ring|jewelry|win|wins)\b"
 )
-_TICKER_RULES = [
+_FX = "USD|EUR|JPY|GBP|AUD|CAD|CHF|NZD|CNH"
+_END = r"(?:-|$)"
+_TICKER_RULES = [  # explicit series roots (+ optional frequency): "KXDOWNTOWN" / "KXFEDCHAIRNOM" must not match
     ("metals", _METALS_TICKER),
-    ("fx", re.compile(r"^KX(?:(?:USD|EUR|JPY|GBP|AUD|CAD|CHF|NZD|CNH)){2}|^KXFX")),
-    ("energy", re.compile(r"^KX(?:WTI|BRENT|OIL|NATGAS|CRUDE|GASOLINE|HENRYHUB|AAAGAS)")),
+    ("fx", re.compile(r"^KX(?:" + _FX + r"){2}" + _FREQ + _END)),
+    (
+        "energy",
+        re.compile(r"^KX(?:WTI|BRENT|OIL|NATGAS|CRUDE|GASOLINE|HENRYHUB|AAAGAS)" + _FREQ + _END),
+    ),
     (
         "rates",
-        re.compile(r"^KX(?:FED|FOMC|CPI|TNOTE|TBILL|TREASURY|SOFR|RATECUT|RATEHIKE|YIELD|10Y|2Y)"),
+        re.compile(
+            r"^KX(?:FED|FEDDECISION|FOMC|CPI|CPIYOY|CORECPI|TNOTE|TBILL|SOFR|RATECUT|RATECUTCOUNT|RATEHIKE|YIELD|10Y|2Y)"
+            + _FREQ
+            + _END
+        ),
     ),
-    ("equity_index", re.compile(r"^KX(?:INX|NASDAQ|NDX|SPX|SP500|DOW|RUSSELL|RUT)")),
+    (
+        "equity_index",
+        re.compile(
+            r"^KX(?:INX|INXU|INXD|INXW|INXY|NASDAQ100|NASDAQ100U|NASDAQ100D|NDX|SPX|SP500|DJIA)"
+            + _FREQ
+            + _END
+        ),
+    ),
 ]
 
 

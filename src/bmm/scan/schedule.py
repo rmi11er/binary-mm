@@ -41,19 +41,23 @@ def reward_hours(prog: Program, now_ns: int, horizon_ns: int = HORIZON_NS) -> fl
     return total
 
 
-def pool_remaining(prog: Program, now_ns: int) -> float:
-    """USD still to be paid by the schedule from now: rate x time left per segment; an open-ended
-    segment contributes one day's pool. No schedule: one day at the current rate."""
+def pool_remaining(prog: Program, now_ns: int, horizon_ns: int = HORIZON_NS) -> float:
+    """USD the schedule still pays INSIDE the horizon reward_hours uses (24h), so reward $/day can never
+    legitimately exceed it. An open-ended segment contributes one day's pool. No schedule: one day at the
+    current rate."""
     segs = segments(prog)
     if not segs:
         return prog.R_usd_hr * 24
+    end_h = now_ns + horizon_ns
     total = 0.0
     for s, e, r in segs:
         lo = max(now_ns, s if s is not None else now_ns)
         if e is None:
             total += r * 24
-        elif e > lo:
-            total += r * (e - lo) / H_NS
+        else:
+            hi = min(e, end_h)
+            if hi > lo:
+                total += r * (hi - lo) / H_NS
     return total
 
 

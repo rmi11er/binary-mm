@@ -130,6 +130,9 @@ class Analysis:
     excluded: list[dict[str, Any]] = field(default_factory=list)
     blocked: list[tuple[str, str, str]] = field(default_factory=list)  # venue, market, reason
     defects: list[dict[str, Any]] = field(default_factory=list)
+    manual: list[dict[str, Any]] = field(
+        default_factory=list
+    )  # needs_manual_check (flag, not exclusion)
     review: list[dict[str, Any]] = field(
         default_factory=list
     )  # needs_review_recurring (not DEFECT)
@@ -172,9 +175,11 @@ def analyze(
     adapters: Mapping[str, Any] | None = None,
     conf: ScanConfig | None = None,
     shares_factor: float = 1.0,
+    include_latency: bool | None = None,
 ) -> Analysis | None:
     """`shares_factor` scales fills estimated from sharesTraded: 1.0 = every contract counted once
     (total/2 per side); 0.5 = both legs of a trade counted (total/4 per side)."""
+    include_latency = _INCLUDE_LATENCY if include_latency is None else include_latency
     snaps_all = store.read("snapshots", date, root)
     if snaps_all.is_empty():
         return None
@@ -293,6 +298,12 @@ def analyze(
             fl.append("no_schedule")
         an.flags[key] = fl
 
+    lat_keys = {
+        k
+        for k in an.period_h
+        if (an.period_h[k] is not None and an.period_h[k] <= 0.26)
+        or an.info[k]["market_id"].split("-")[0].upper().endswith("15M")
+    }  # latency-game: 15-minute series, won on quote speed this scanner cannot measure
     blocked_markets: set[tuple[str, str]] = set()
     pre: list[tuple[Half, dict[str, Any]]] = []
     for h, r in an.halves:
@@ -300,7 +311,7 @@ def analyze(
         if why and (h.venue, r["market_id"]) not in blocked_markets:
             blocked_markets.add((h.venue, r["market_id"]))
             an.blocked.append((h.venue, r["market_id"], why))
-        elif not why:
+        elif not why and (include_latency or h.key not in lat_keys):
             pre.append((h, r))
 
     # --- sanity guard: RoC > 100%/day or reward above the pool still to be paid = DEFECT ---
@@ -322,7 +333,15 @@ def analyze(
     defect_keys: set[str] = set()
     an.stats = stats
     for h, r in guarded:
+        if h.key in lat_keys and not include_latency:
+            continue
         st, pool = stats[h.key], an.pools[h.key]
+        manual = (["RoC > 100%/day standalone"] if st["roc_active"] > MAX_ROC_DAY else []) + (
+            ["reward > 50% of market pool"] if mkt_reward[h.market] > 0.5 * pool else []
+        )
+        if manual:
+            an.flags[h.key].append("needs_manual_check")
+            an.manual.append({"market": h.market, "side": r["side"], "reasons": manual})
         structural: list[str] = []
         roc_reasons: list[str] = []
         if h.coll <= 0:
@@ -402,6 +421,7 @@ def analyze(
         an.status[k] = (
             "needs_review_recurring" if k in review_keys
             else "DEFECT" if k in defect_k
+            else "latency_game_excluded" if k in lat_keys and not include_latency
             else "not_allocated" if k not in pre_keys
             else "pending_markouts" if h.c_lower_bound
             else "allocated" if a_ is not None and a_.s > 0
@@ -926,6 +946,85 @@ def build_report(
         + ("" if metals else ". No metals programs were scanned.")
         + "\n"
     )
+    s7c = (
+        "## 7c. needs_manual_check\n\n"
+        f"needs_manual_check half-markets: {len(an.manual)}\n\n"
+        "Flag, not an exclusion: standalone RoC > 100%/day, or our modelled reward > 50% of the market's pool "
+        "(a share that large usually means the competing depth is understated).\n\n"
+        + _table(
+            ["market", "side", "reasons"],
+            [[m["market"], m["side"], "; ".join(m["reasons"])] for m in an.manual],
+        )
+    )
+    lat_rows: list[list[Any]] = []
+    lat_m: defaultdict[str, list[str]] = defaultdict(list)
+    for k_, st_ in an.status.items():
+        if st_ == "latency_game_excluded":
+            lat_m[f"{info[k_]['venue']}:{info[k_]['market_id']}"].append(k_)
+    for m_, keys in sorted(lat_m.items()):
+        k0 = keys[0]
+        rd = sum(an.stats[k_]["rd"] for k_ in keys if k_ in an.stats)
+        cd = sum(an.stats[k_]["cd"] for k_ in keys if k_ in an.stats)
+        col = sum(an.stats[k_]["col"] for k_ in keys if k_ in an.stats)
+        stl = sum(an.stats[k_]["s0"] * an.stress_per[k_] for k_ in keys if k_ in an.stats)
+        lat_rows.append(
+            [m_, info[k0]["category"], m_.split(":", 1)[1].split("-")[0], an.stream[k0], an.pool_win[k0], an.pools[k0],
+             rd, cd, col, (rd - cd) / col if col > 0 else None, stl, "/".join(sorted({an.markout[k_][1] for k_ in keys})),
+             " ".join(sorted({f for k_ in keys for f in an.flags[k_]}))]
+        )  # fmt: skip
+    s9b = (
+        "## 9b. latency-game, excluded\n\n"
+        f"15-minute series (crypto, FX, metals, ...): {len(lat_rows)} markets excluded from allocation by default. "
+        "They are won on quote speed and on adverse selection over minutes, neither of which this scanner measures; "
+        "figures are standalone s*, upper bounds. Re-include with `bmm scan report --include-latency-game`.\n\n"
+        + _table(
+            [
+                "market",
+                "category",
+                "series",
+                "windows",
+                "pool/window $",
+                "pool_remaining $",
+                "reward $/day",
+                "cost $/day",
+                "collateral $ (per window)",
+                "RoC/day",
+                "stress $",
+                "markout src",
+                "flags",
+            ],
+            lat_rows,
+        )
+    )
+    al_df = store.read("alerts", None, root)
+    al_rows = (
+        [
+            [
+                r["venue"],
+                r["series"],
+                r["ticker"],
+                r["status"],
+                r["pool_usd"],
+                r["target"],
+                "NEW" if r["new"] else "seen",
+            ]
+            for r in al_df.sort("ts_ns", descending=True).head(30).iter_rows(named=True)
+        ]
+        if not al_df.is_empty()
+        else []
+    )
+    s11 = (
+        "## 11. Alerts (incentive programs on watched series)\n\n"
+        "Watched: KXGOLDH, KXGOLDD, KXCOPPERD (hourly/daily metals). A program on any of them is printed as ALERT "
+        "by the scan and listed here.\n\n"
+        + (
+            _table(
+                ["venue", "series", "ticker", "status", "pool $", "target", "first seen?"], al_rows
+            )
+            if al_rows
+            else "No incentive program has appeared on a watched series.\n"
+        )
+    )
     sens = sensitivity(date, root, adapters, conf)
     s8 = (
         "## 8. sharesTraded counting sensitivity\n\n"
@@ -938,7 +1037,7 @@ def build_report(
             [[m["market"], m["rank_a"], m["rank_b"]] for m in sens["moved"]],
         )
     )
-    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}\n\n{s7}\n\n{s7b}\n\n{s8}\n\n{s9}\n\n{quality_section(date, root)}"
+    return f"{head}\n{s1}\n\n{s2}\n\n{s3}\n\n{s4}\n\n{s5}\n\n{s6}\n\n{s7}\n\n{s7b}\n\n{s7c}\n\n{s8}\n\n{s9}\n\n{s9b}\n\n{quality_section(date, root)}\n\n{s11}"
 
 
 def quality_stats(date: str, root: Path = store.DEFAULT_ROOT) -> dict[str, Any]:
@@ -1059,9 +1158,17 @@ def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -
     return s
 
 
+_INCLUDE_LATENCY = False
+
+
 def write_report(
-    date: str | None, root: Path = store.DEFAULT_ROOT, out_dir: Path = Path("reports")
+    date: str | None,
+    root: Path = store.DEFAULT_ROOT,
+    out_dir: Path = Path("reports"),
+    include_latency: bool = False,
 ) -> int:
+    global _INCLUDE_LATENCY
+    _INCLUDE_LATENCY = include_latency
     d = date or datetime.fromtimestamp(now_ns() / 1e9, tz=UTC).strftime("%Y-%m-%d")
     md = build_report(d, root)
     out_dir.mkdir(parents=True, exist_ok=True)

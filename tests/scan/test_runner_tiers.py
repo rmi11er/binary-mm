@@ -214,3 +214,19 @@ def test_gap_since_last_scan_is_paged_until_closed(tmp_path):
     out = asyncio.run(snapshot_once([g], NOW + H_NS, root=tmp_path))
     assert (NOW - 2 * H_NS + 1, "g1") in g.calls  # followed the cursor of the new-trades fetch
     assert len(out["trades"]) == 2  # both pages kept
+
+
+class Al(A):
+    async def programs(self):
+        self.alerts = [{"venue": "v", "series": "KXGOLDH", "ticker": "KXGOLDH-X", "id": "i1", "status": "upcoming",
+                        "pool_usd": 20.0, "start_ns": NOW, "end_ns": NOW + H_NS, "target": 300.0}]  # fmt: skip
+        return await super().programs()
+
+
+def test_alert_rows_flag_only_the_first_sighting(tmp_path):
+    out1 = asyncio.run(snapshot_once([Al()], NOW, root=tmp_path))
+    assert out1["alerts"] and out1["alerts"][0]["new"] is True
+    for t, rws in out1.items():
+        store.write(t, rws, NOW, tmp_path)
+    out2 = asyncio.run(snapshot_once([Al()], NOW + H_NS, root=tmp_path))
+    assert out2["alerts"][0]["new"] is False

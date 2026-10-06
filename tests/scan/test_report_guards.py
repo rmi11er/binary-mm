@@ -172,10 +172,11 @@ def test_budget_limited_small_size_is_listed_not_excluded(tmp_path):
 MINUTE = 60 * 10**9
 
 
-def stream_pk(rate=80.0, windows=100, pool=None):
-    segs = [(TS + i * 15 * MINUTE, TS + (i + 1) * 15 * MINUTE, rate) for i in range(windows)]
+def stream_pk(rate=80.0, windows=100, window_min=60):
+    w = window_min * MINUTE
+    segs = [(TS + i * w, TS + (i + 1) * w, rate) for i in range(windows)]
     return {"R_usd_hr": rate, "schedule": make_schedule(segs), "stream_windows": windows,
-            "start_ns": TS, "end_ns": TS + 15 * MINUTE, "pool_usd": rate / 4}  # fmt: skip
+            "start_ns": TS, "end_ns": TS + w, "pool_usd": rate * window_min / 60}  # fmt: skip
 
 
 def test_high_return_recurring_stream_is_needs_review_not_defect(tmp_path):
@@ -207,14 +208,74 @@ def test_pool_breach_on_a_stream_is_still_a_defect(tmp_path):
     assert a.defects and not a.review
 
 
-def test_metals_section_lists_streams_with_status_and_other_metals_programs(tmp_path):
+def test_metals_section_lists_15m_streams_as_latency_game_and_other_metals_programs(tmp_path):
     seed2(tmp_path, [
-        ("KXPALLADIUM15M-X", {"category": "metals"}, stream_pk()),
+        ("KXPALLADIUM15M-X", {"category": "metals"}, stream_pk(window_min=15)),
         ("KXSILVERD-Y", {"category": "metals"}, {"R_usd_hr": 1.0, "start_ns": TS, "end_ns": TS + 24 * 60 * MINUTE}),
-        ("KXUSDJPY15M-Z", {"category": "fx"}, stream_pk()),
+        ("KXUSDJPY15M-Z", {"category": "fx"}, stream_pk(window_min=15)),
     ])  # fmt: skip
     md = build_report(DATE, tmp_path, adapters=ADS, conf=GEM)
-    sec = md.split("## 9. Metals 15-minute streams")[1].split("## 10.")[0]
-    assert "KXPALLADIUM15M-X" in sec and "needs_review_recurring" in sec
+    sec = md.split("## 9. Metals 15-minute streams")[1].split("## 9b.")[0]
+    assert "KXPALLADIUM15M-X" in sec and "latency_game_excluded" in sec
     assert "KXUSDJPY15M-Z" not in sec  # not metals
     assert "Metals programs with a period > 1h this scan: 1" in sec and "KXSILVERD-Y" in sec
+    lat = md.split("## 9b. latency-game, excluded")[1].split("## 10.")[0]
+    assert (
+        "KXPALLADIUM15M-X" in lat and "KXUSDJPY15M-Z" in lat
+    )  # every 15-minute series, any category
+    assert "KXSILVERD-Y" not in lat
+
+
+def test_15m_series_are_not_allocated_by_default_but_are_when_included(tmp_path):
+    seed2(
+        tmp_path,
+        [
+            ("KXGOLD15M-A", {"category": "metals"}, stream_pk(rate=6.0, window_min=15)),
+            ("OK1", {}, {}),
+        ],
+    )
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert not any("KXGOLD15M-A" in k and x.s > 0 for k, x in a.allocs.items())
+    assert {a.status[k] for k in a.status if "KXGOLD15M-A" in k} == {"latency_game_excluded"}
+    assert not a.defects and not a.review  # excluded before the guard: not DEFECT, not review
+    b = analyze(DATE, tmp_path, ADS, GEM, include_latency=True)
+    assert any(
+        "KXGOLD15M-A" in k and x.s > 0 for k, x in b.allocs.items()
+    )  # --include-latency-game
+
+
+def test_latency_exclusion_follows_the_period_even_without_a_15m_ticker(tmp_path):
+    seed2(
+        tmp_path, [("FASTMKT", {}, {"start_ns": TS, "end_ns": TS + 15 * MINUTE, "R_usd_hr": 6.0})]
+    )
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert {a.status[k] for k in a.status} == {"latency_game_excluded"}
+
+
+class Stub2(Stub):
+    """Deep competing book: our share of the pool stays small."""
+
+    def expected_reward(self, prog, s, side, book):
+        return 0.5 * prog.R_usd_hr * s / (s + 10000) if s > 0 else 0.0
+
+
+def test_needs_manual_check_flags_reward_above_half_the_pool_only(tmp_path):
+    seed2(tmp_path, [("TOP", {}, {})])  # Stub: we take ~97% of the pool
+    a = analyze(DATE, tmp_path, ADS, GEM)
+    assert any(m["market"] == "v:TOP" and any("50%" in r for r in m["reasons"]) for m in a.manual)
+    assert all("needs_manual_check" in a.flags[k] for k in a.flags)
+    seed2(tmp_path / "deep", [("DEEP", {}, {})])
+    b = analyze(DATE, tmp_path / "deep", {"v": Stub2()}, GEM)
+    assert not any(m["market"] == "v:DEEP" for m in b.manual)  # small share: no flag
+
+
+def test_alerts_section_lists_programs_on_watched_series(tmp_path):
+    seed2(tmp_path, [("OK1", {}, {})])
+    row = {"venue": "kalshi", "series": "KXGOLDH", "ticker": "KXGOLDH-26OCT0610-T3000", "id": "i1", "status": "upcoming",
+           "pool_usd": 20.0, "start_ns": TS, "end_ns": TS + 60 * MINUTE, "target": 300.0, "ts_ns": TS, "new": True}  # fmt: skip
+    store.write("alerts", [row], TS, tmp_path)
+    md = build_report(DATE, tmp_path, adapters=ADS, conf=GEM)
+    sec = md.split("## 11. Alerts")[1]
+    assert "KXGOLDH-26OCT0610-T3000" in sec and "NEW" in sec
+    empty = build_report(DATE, tmp_path / "none", adapters=ADS, conf=GEM)
+    assert "No snapshots" in empty

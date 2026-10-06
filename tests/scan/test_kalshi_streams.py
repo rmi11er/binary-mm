@@ -72,13 +72,13 @@ def test_recurring_short_windows_become_a_stream_with_summed_pools():
     assert reward_hours(p, NOW) == pytest.approx(
         24.0
     )  # contiguous windows cover the whole next 24h
-    assert pool_remaining(p, NOW) == pytest.approx(80.0 * 10 / 60 + 96 * 20.0)
+    assert pool_remaining(p, NOW) == pytest.approx(80.0 * 24)
 
 
 def test_windows_with_several_strikes_count_once():
     active, up = stream_rows(per_window=3)
     p = asyncio.run(adapter(Paged(active, up)).programs())[0]
-    assert pool_remaining(p, NOW) == pytest.approx(80.0 * 10 / 60 + 96 * 20.0)  # not x3
+    assert pool_remaining(p, NOW) == pytest.approx(80.0 * 24)  # not x3
 
 
 def test_fewer_than_three_windows_is_not_a_stream():
@@ -124,6 +124,10 @@ def test_triage_domain_series_first_then_pool_per_day():
         ("KXWTI-26OCT06-T70", "energy"),
         ("KXFED-26DEC-T4.00", "rates"),
         ("KXINXU-26OCT06-T5000", "equity_index"),
+        ("KXGOLDMAX-26OCT-1", "metals"),
+        ("KXFEDCHAIRNOM-26-1", None),
+        ("KXDOWNTOWN-26-1", None),
+        ("KXRATECUTCOUNT-26DEC-T3", "rates"),
         ("KXAGICO-26OCT-1", None),
         ("KXTRUMPSAY-26OCT-1", None),
         ("KXGOLDCARD-26-1", None),
@@ -154,9 +158,67 @@ def test_ticker_category_has_no_metals_false_positives(ticker, cat):
         ("BOE gold withdrawals", False),
         ("BTC vs Gold", False),
         ("who will win the gold bachelor", False),
+        ("Will gold hit a record high in 2026?", True),
+        ("Will silver hit $50 by December?", True),
+        ("Gold price above $4,000 after tariffs?", True),
+        ("Will Copper win the race? Up next", False),
         ("What will Trump say this week?", False),
         ("Will an AGI company IPO?", False),
     ],
 )
 def test_metals_title_rule(title, is_metals):
     assert (classify(title) == "metals") is is_metals
+
+
+def test_overlapping_programs_in_a_series_are_not_a_stream():
+    h = 60 * MIN
+    a_ = row(1, "KXSERH-A", NOW - h, 24 * 60, pool=240.0)  # a day-long program ...
+    b_ = row(2, "KXSERH-B", NOW + 9 * h, 60, pool=10.0)  # ... overlapping hourly ones
+    up = [
+        row(3, "KXSERH-C", NOW + 10 * h, 60, pool=10.0),
+        row(4, "KXSERH-D", NOW + 11 * h, 60, pool=10.0),
+    ]
+    progs = {p.market_id: p for p in asyncio.run(adapter(Paged([a_, b_], up)).programs())}
+    assert progs["KXSERH-A"].stream_windows == 0 and progs["KXSERH-B"].stream_windows == 0
+    assert reward_hours(progs["KXSERH-A"], NOW) == pytest.approx(
+        23.0
+    )  # its own window only, never > 24
+    assert reward_hours(progs["KXSERH-B"], NOW) == pytest.approx(1.0)
+
+
+def test_series_without_a_recurring_suffix_is_not_a_stream():
+    h = 60 * MIN
+    act = [row(1, "KXMLBGAME-A", NOW - 10 * MIN, 60)]
+    up = [
+        row(2 + j, f"KXMLBGAME-{j}", NOW + 50 * MIN + j * h, 60) for j in range(5)
+    ]  # three different games
+    p = asyncio.run(adapter(Paged(act, up)).programs())[0]
+    assert p.stream_windows == 0 and reward_hours(p, NOW) == pytest.approx(50 / 60)
+
+
+def test_alerts_for_hourly_and_daily_metals_even_when_triage_drops_them():
+    act = [
+        row(1, "KXGOLDH-26OCT0610-T3000", NOW - 5 * MIN, 60),
+        row(2, "KXGOLDCARD-1", NOW - 5 * MIN, 24 * 60, pool=900.0),
+    ]
+    up = [row(3, "KXCOPPERD-26OCT07-T5", NOW + 30 * MIN, 24 * 60)]
+    a = adapter(Paged(act, up), max_markets=1)
+    asyncio.run(a.programs())
+    got = {(x["series"], x["status"]) for x in a.alerts}
+    assert got == {
+        ("KXGOLDH", "active"),
+        ("KXCOPPERD", "upcoming"),
+    }  # KXGOLDCARD is not on the watch list
+    quiet = adapter(Paged([row(9, "KXGOLDCARD-1", NOW - 5 * MIN, 60)]))
+    asyncio.run(quiet.programs())
+    assert quiet.alerts == []
+
+
+def test_per_series_cap_keeps_one_series_from_eating_the_triage_budget():
+    gas = [row(i, f"KXAAAGASW-26OCT-T{i}", NOW - 60 * MIN, 24 * 60) for i in range(10)]
+    gold = [row(20 + i, f"KXGOLDD-26OCT-T{i}", NOW - 60 * MIN, 24 * 60) for i in range(5)]
+    got = asyncio.run(adapter(Paged(gas + gold), max_markets=6, series_cap=3).programs())
+    per = {}
+    for p in got:
+        per[p.market_id.split("-")[0]] = per.get(p.market_id.split("-")[0], 0) + 1
+    assert per == {"KXAAAGASW": 3, "KXGOLDD": 3}

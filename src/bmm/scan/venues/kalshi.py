@@ -4,7 +4,9 @@ so asks are derived from the NO bids."""
 from __future__ import annotations
 
 import bisect
+import re
 import statistics
+from itertools import pairwise
 from typing import Any
 
 from bmm.clock import now_ns
@@ -27,6 +29,12 @@ from bmm.scan.venues.common import (
 )
 
 API = "https://external-api.kalshi.com/trade-api/v2"
+WATCH_DEFAULT = (
+    "KXGOLDH",
+    "KXGOLDD",
+    "KXCOPPERD",
+)  # hourly/daily metals: alert when a program appears
+_STREAM_SUFFIX = re.compile(r"(?:15M|30M|H)$")
 
 
 def _grid(
@@ -46,6 +54,7 @@ def _grid(
 
 class Kalshi:
     name = "kalshi"
+    alerts: list[dict[str, Any]]  # programs on watched series, set by programs()
     _now = staticmethod(now_ns)  # injectable clock (tests)
 
     def __init__(self, client: GetOnlyClient, cfg: VenueCfg) -> None:
@@ -80,18 +89,30 @@ class Kalshi:
         return rows
 
     async def programs(self) -> list[Program]:
-        """Active programs, triaged for fetching: metals/FX/energy/rates/equity-index series first, then
-        pool $/day descending, capped at max_markets (the per-host pacing budget).
+        """Active programs, triaged for fetching: domain series first (metals/FX/energy/rates/equity index),
+        then pool $/day descending, at most `series_cap` per series and `max_markets` in total (the per-host
+        pacing budget).
 
-        A series of recurring short windows (>= 3 windows within the next 24h, median <= 1h, e.g. the
-        15-minute metals markets) is a STREAM: each program's schedule holds every window of the series,
-        so $/day = the sum of the scheduled windows' pools while collateral stays the per-window
-        requirement. Windows sharing a start time (several strikes) count once, at the median pool."""
+        STREAM: a recurring series of short windows (ticker series ending 15M or H, >= 3 successive
+        NON-OVERLAPPING windows of near-uniform length <= 1h, one of which is the program's own) gets a
+        schedule of every window, so $/day = the sum of the scheduled pools over the next 24h while collateral
+        stays the per-window requirement. Windows sharing a start (several strikes) count once, at the median
+        pool. Anything else keeps its single window; the recurring-ness is inferred from the ticker suffix."""
         active = await self._fetch_all("active")
         ids = {p["id"] for p in active}
         upcoming = [p for p in await self._fetch_all("upcoming") if p["id"] not in ids]
         now = self._now()
         horizon = now + 24 * H_NS
+        watch = set(self.cfg.raw.get("watch_series", WATCH_DEFAULT))
+        self.alerts = [
+            {"venue": self.name, "series": p["market_ticker"].split("-")[0], "ticker": p["market_ticker"],
+             "id": p["id"], "status": status, "pool_usd": float(p["period_reward"]) / 1e4,
+             "start_ns": iso_ns(p["start_date"]), "end_ns": iso_ns(p["end_date"]),
+             "target": float(p["target_size_fp"])}
+            for status, rows in (("active", active), ("upcoming", upcoming))
+            for p in rows
+            if p["market_ticker"].split("-")[0] in watch
+        ]  # fmt: skip
 
         def parse(p: dict[str, Any]) -> dict[str, Any] | None:
             start, end = iso_ns(p["start_date"]), iso_ns(p["end_date"])
@@ -103,6 +124,8 @@ class Kalshi:
         parsed = [x for x in (parse(p) for p in active) if x]
         by_win: dict[str, dict[int, list[tuple[int, float]]]] = {}
         for x in [*parsed, *(y for y in (parse(p) for p in upcoming) if y)]:
+            if x["end"] <= now or x["start"] >= horizon:
+                continue  # only windows that still pay inside the next 24h
             by_win.setdefault(x["series"], {}).setdefault(x["start"], []).append(
                 (x["end"], x["pool"])
             )
@@ -110,13 +133,22 @@ class Kalshi:
         for ser, ws in by_win.items():
             segs = []
             for st, lst in sorted(ws.items()):
-                if st > horizon:
-                    continue
                 end = max(e for e, _ in lst)
                 segs.append(
                     (st, end, statistics.median(pl_ for _, pl_ in lst) / ((end - st) / H_NS))
                 )
             series_windows[ser] = segs
+
+        def is_stream(sw: list[tuple[int, int, float]], own: tuple[int, int], series: str) -> bool:
+            if len(sw) < 3 or not _STREAM_SUFFIX.search(series):
+                return False
+            durs = [e - s for s, e, _ in sw]
+            if statistics.median(durs) > H_NS or max(durs) > 1.5 * min(durs):
+                return False
+            if any(s2 < e1 - 10**9 for (_, e1, _), (s2, _, _) in pairwise(sw)):
+                return False  # overlapping windows are different instruments, not successive copies of one
+            return own in {(s, e) for s, e, _ in sw}
+
         out: list[Program] = []
         for x in parsed:
             p = x["p"]
@@ -124,7 +156,7 @@ class Kalshi:
             segs = [(x["start"], x["end"], rate)]
             n = 0
             sw = series_windows.get(x["series"], [])
-            if len(sw) >= 3 and statistics.median(e - s for s, e, _ in sw) <= H_NS:
+            if is_stream(sw, (x["start"], x["end"]), x["series"]):
                 segs, n = list(sw), len(sw)
             out.append(
                 Program(
@@ -145,7 +177,16 @@ class Kalshi:
             return (0 if dom else 1, -prog.R_usd_hr * reward_hours(prog, now), prog.market_id)
 
         out.sort(key=key)
-        return out[: int(self.cfg.raw.get("max_markets", 100))]
+        cap = int(self.cfg.raw.get("series_cap", 6))
+        taken: dict[str, int] = {}
+        picked: list[Program] = []
+        for prog in out:
+            ser = prog.market_id.split("-")[0]
+            if taken.get(ser, 0) >= cap:
+                continue
+            taken[ser] = taken.get(ser, 0) + 1
+            picked.append(prog)
+        return picked[: int(self.cfg.raw.get("max_markets", 100))]
 
     async def meta(self, market_id: str) -> MarketMeta:
         m: dict[str, Any] = (await self.c.get_json(f"{API}/markets/{market_id}"))["market"]

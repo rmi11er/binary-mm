@@ -26,6 +26,7 @@ def main(argv: list[str]) -> int:
     b.add_argument("--every", type=float, default=2.0)
     rep = sub.add_parser("report")
     rep.add_argument("--date", default=None)
+    rep.add_argument("--include-latency-game", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "rewards":
         from bmm.scan.runner import run
@@ -37,4 +38,4 @@ def main(argv: list[str]) -> int:
         return run_burst(args.venues.split(","), args.top, args.seconds, args.every)
     from bmm.scan.report import write_report
 
-    return write_report(args.date)
+    return write_report(args.date, include_latency=args.include_latency_game)

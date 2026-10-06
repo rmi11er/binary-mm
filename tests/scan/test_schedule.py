@@ -48,7 +48,7 @@ def test_multi_period_schedule_weights_by_rate_relative_to_current():
     assert reward_hours(p, NOW) == pytest.approx(
         2 * 1 + 22 * 2
     )  # effective hours at the current rate
-    assert pool_remaining(p, NOW) == pytest.approx(10 * 2 + 20 * 24)
+    assert pool_remaining(p, NOW) == pytest.approx(10 * 2 + 20 * 22)
 
 
 def test_open_ended_period_assumed_to_continue_one_pool_per_day():

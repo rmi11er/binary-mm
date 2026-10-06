@@ -341,7 +341,8 @@ async def snapshot_once(
 ) -> dict[str, list[dict[str, Any]]]:
     """One pass. `only` = fast tier: just those (venue, market) pairs, from stored terms and meta."""
     out: dict[str, list[dict[str, Any]]] = {
-        k: [] for k in ("snapshots", "programs", "trades", "books", "proxy_mids", "cursors")
+        k: []
+        for k in ("snapshots", "programs", "trades", "books", "proxy_mids", "cursors", "alerts")
     }
     ctx = Ctx(
         _history("snapshots", now, root),
@@ -350,6 +351,14 @@ async def snapshot_once(
         _history("programs", now, root) if only is not None else pl.DataFrame(),
     )
     ctx.cursors = _history("cursors", now, root, days=8)
+    seen_alerts = (
+        {
+            (r["venue"], r["id"])
+            for r in _history("alerts", now, root, days=30).iter_rows(named=True)
+        }
+        if not _history("alerts", now, root, days=30).is_empty()
+        else set()
+    )
     if ctx.trades.is_empty() is False:
         ctx.trades = ctx.trades.unique(subset=["venue", "market_id", "ts_ns", "price", "size"])
     stored_meta: dict[tuple[str, str], MarketMeta] = {}
@@ -383,6 +392,10 @@ async def snapshot_once(
                 log.warning("venue %s skipped: %s", a.name, e)
                 return
             items = [(p, None) for p in progs]
+            for al in getattr(a, "alerts", None) or []:
+                out["alerts"].append(
+                    {**al, "ts_ns": now, "new": (a.name, al["id"]) not in seen_alerts}
+                )
         else:
             items = [
                 (stored_prog[k], stored_meta.get(k))
@@ -412,6 +425,12 @@ async def _loop(adapters: list[VenueAdapter], conf: cfgmod.ScanConfig, once: boo
             only = top_candidates(root, top_n, _day(ts)) or None
         tables = await snapshot_once(adapters, ts, conf.venue, root, only=only)
         _flush(tables, ts, root)
+        for al in tables.get("alerts", []):
+            if al["new"]:
+                print(
+                    f"ALERT: {al['venue']} {al['series']} program {al['status']}: {al['ticker']} pool ${al['pool_usd']:,.2f}",
+                    flush=True,
+                )
         if only is None:
             refresh_ranking(_day(ts), root, ads, conf)
         dt = time.monotonic() - t0
