@@ -765,20 +765,23 @@ def build_report(
 
 
 def quality_stats(date: str, root: Path = store.DEFAULT_ROOT) -> dict[str, Any]:
-    """Per-market stale quotes (venue_ref markets, fast-tier snapshots only), D churn (all
-    snapshots) and requote cadence (burst samples)."""
+    """Per-market stale quotes (venue_ref markets, fast-tier snapshots only), D churn (timestamps
+    with both side rows) and requote cadence (burst samples)."""
     out: dict[str, Any] = {"stale": {}, "churn": {}, "churn_n": {}, "cadence": {}}
     snaps = store.read("snapshots", date, root)
     if not snaps.is_empty():
         by: defaultdict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
         for r in snaps.iter_rows(named=True):
-            e = by[f"{r['venue']}:{r['market_id']}"].setdefault(int(r["ts_ns"]), {"D": 0.0, "r": r})
+            key = f"{r['venue']}:{r['market_id']}"
+            e = by[key].setdefault(int(r["ts_ns"]), {"D": 0.0, "n": 0, "r": r})
             e["D"] += r.get("D_side") or 0.0
+            e["n"] += 1
         for k, d in by.items():
             order = sorted(d)
-            cv = d_churn([d[t]["D"] for t in order])
+            both = [t for t in order if d[t]["n"] >= 2]  # a missing side row would read as D = 0
+            cv = d_churn([d[t]["D"] for t in both])
             if cv is not None:
-                out["churn"][k], out["churn_n"][k] = cv, len(order)
+                out["churn"][k], out["churn_n"][k] = cv, len(both)
             pts = [
                 {"ts_ns": t, "bid": d[t]["r"].get("bid"), "ask": d[t]["r"].get("ask"),
                  "bid_size": d[t]["r"].get("bid_size"), "ask_size": d[t]["r"].get("ask_size"),
@@ -808,17 +811,21 @@ def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -
     if q["stale"]:
         ranked = sorted(q["stale"].items(), key=lambda kv: (-kv[1]["stale_pct"], kv[0]))[:top]
         s += (
-            "### Stale quotes vs venue reference\n\nFast-tier snapshots of venue_ref markets only. Stale = best bid > "
-            "ref_fair + fee + 0.01 or best ask < ref_fair - fee - 0.01. takeable $/day = displayed touch size x "
-            "(edge - taker fee), one fill per stale episode, over the observed span (a lower bound).\n\n"
+            "### Stale quotes vs venue reference\n\nFast-tier snapshots of venue_ref markets only, with a VERIFIED "
+            "taker fee. Stale = best bid > ref_fair + fee + 0.01 or best ask < ref_fair - fee - 0.01. "
+            "First-touch takeable $/day = displayed touch size x edge, less the order fee rounded up to the cent, "
+            "one fill per stale episode, over the observed span. It ignores latency and competition for the "
+            "size (optimistic) and deeper levels and refills (pessimistic): neither a bound nor a forecast. "
+            "Censored runs touch the first or last snapshot (their duration is a lower bound).\n\n"
             + _table(
                 [
                     "market",
                     "scored snapshots",
                     "stale_pct",
                     "episodes",
+                    "censored runs",
                     "median stale run (s)",
-                    "takeable $/day (fee-adjusted)",
+                    "first-touch takeable $/day (fee-adjusted)",
                 ],
                 [
                     [
@@ -826,6 +833,7 @@ def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -
                         v["n_scored"],
                         v["stale_pct"],
                         v["episodes"],
+                        v["censored_runs"],
                         v["median_run_s"],
                         v["takeable_day"],
                     ]
@@ -837,13 +845,13 @@ def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -
     else:
         s += (
             "### Stale quotes vs venue reference\n\nStale-quote metrics: no market has a venue reference "
-            "(reference_quality = venue_ref with a ref_fair from the venue) and fast-tier snapshots yet. "
-            "No adapter supplies a reference fair value today, so nothing is scored; wire a `reference_fair` "
-            "source per venue to enable this.\n\n"
+            "(reference_quality = venue_ref with a ref_fair from the venue, and a verified taker fee) and "
+            "fast-tier snapshots yet. No adapter supplies a reference fair value today, so nothing is scored; "
+            "wire a `reference_fair` source per venue to enable this.\n\n"
         )
     ch = sorted(q["churn"].items(), key=lambda kv: -kv[1])[:15]
     s += (
-        "### D churn (coefficient of variation of D across snapshots)\n\nNeeds at least 5 snapshots per market.\n\n"
+        "### D churn (coefficient of variation of D across snapshots)\n\nNeeds at least 5 snapshots with both side rows.\n\n"
         + _table(["market", "D churn (CV)", "snapshots"], [[k, v, q["churn_n"][k]] for k, v in ch])
         + "\n\n### Touch requote cadence (burst samples)\n\n"
     )
@@ -851,20 +859,23 @@ def quality_section(date: str, root: Path = store.DEFAULT_ROOT, top: int = 10) -
         rows = []
         for k, c in sorted(q["cadence"].items()):
             fl = ", ".join(
-                f"clustering at {p}s ({f['share']:.0%} of intervals)"
+                f"clustering at {p}s ({f['share']:.0%} of intervals vs {f['expected']:.0%} expected if random)"
                 for p, f in c["flags"].items()
                 if f["flag"]
             )
             rows.append([k, c["n"], c["sample_dt"], *c["hist"].values(), fl or "-"])
-        s += _table(
-            [
-                "market",
-                "touch changes",
-                "sample dt (s)",
-                *next(iter(q["cadence"].values()))["hist"].keys(),
-                "flags",
-            ],
-            rows,
+        s += (
+            "Touch PRICE changes only; periods shorter than 3 sampling intervals are not testable.\n\n"
+            + _table(
+                [
+                    "market",
+                    "touch changes",
+                    "sample dt (s)",
+                    *next(iter(q["cadence"].values()))["hist"].keys(),
+                    "flags",
+                ],
+                rows,
+            )
         )
     else:
         s += "No burst samples for this date: run `bmm scan burst` (a 5-minute snapshot cannot resolve 5/30/60 s requoting).\n"

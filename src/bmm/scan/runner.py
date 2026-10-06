@@ -317,7 +317,7 @@ async def _market_rows(
                 "markout_proxied_side": m_prox, "n_markout_proxied_side": n_prox,
                 "mid_source": source, "weak_proxy": source in WEAK_SOURCES,
                 "tier": "full" if write_terms else "fast", "bid_size": bid_size, "ask_size": ask_size,
-                "ref_fair": ref_fair, "taker_fee_coeff": cfg.raw.get("taker_fee") if cfg else None,
+                "ref_fair": ref_fair, "taker_fee_coeff": cfg.raw.get("taker_fee") if cfg and cfg.raw.get("taker_fee_verified") else None,
                 "vol30_proxy": vol30, "jump_p99_1h": p99,
                 "n_trades_side": sum(1 for t in tr_24 if side_of(t, mid) == s),
                 "coll_side": eval_coll(str(expr), px), "coll_verified": verified,

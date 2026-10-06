@@ -71,7 +71,7 @@ def test_runner_rows_carry_tier_touch_sizes_reference_and_taker_fee(tmp_path):
         async def reference_fair(self, market_id):
             return 0.5
 
-    cfg = {"v": VenueCfg("v", {"taker_fee": 0.0695})}
+    cfg = {"v": VenueCfg("v", {"taker_fee": 0.0695, "taker_fee_verified": True})}
     r = asyncio.run(snapshot_once([RefA()], NOW, cfgs=cfg, root=tmp_path))["snapshots"][0]
     assert (r["tier"], r["bid_size"], r["ask_size"], r["ref_fair"], r["taker_fee_coeff"]) == (
         "full",
@@ -83,3 +83,14 @@ def test_runner_rows_carry_tier_touch_sizes_reference_and_taker_fee(tmp_path):
     plain = asyncio.run(snapshot_once([A()], NOW, cfgs=cfg, root=tmp_path / "p"))["snapshots"][0]
     assert plain["ref_fair"] is None  # no venue_ref -> the hook is never consulted
     assert pytest.approx(plain["bid_size"]) == 10.0
+
+
+def test_unverified_taker_fee_is_not_used(tmp_path):
+    from bmm.scan.config import VenueCfg
+    from bmm.scan.runner import snapshot_once
+
+    from .test_runner_tiers import NOW, A
+
+    cfg = {"v": VenueCfg("v", {"taker_fee": 0.07, "taker_fee_verified": False})}
+    r = asyncio.run(snapshot_once([A()], NOW, cfgs=cfg, root=tmp_path))["snapshots"][0]
+    assert r["taker_fee_coeff"] is None  # never score on a guessed fee

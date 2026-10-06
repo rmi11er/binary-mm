@@ -14,7 +14,6 @@ from bmm.clock import now_ns
 from bmm.scan import config as cfgmod
 from bmm.scan import store
 from bmm.scan.http import GetOnlyClient
-from bmm.scan.report import top_candidates
 
 log = logging.getLogger("bmm.scan")
 
@@ -32,12 +31,13 @@ async def run_burst(
     start = now()
     end = start + int(seconds * 1e9)
 
-    async def one(venue: str, mkt: str, ts: int) -> None:
+    async def one(venue: str, mkt: str) -> None:
         try:
             book = await adapters[venue].book(mkt)
         except Exception as e:  # noqa: BLE001 - one bad market must not stop the burst; logged
             log.warning("burst %s/%s skipped: %r", venue, mkt, e)
             return
+        ts = now()  # stamp when the book arrived, not at tick start (throttled requests queue)
         b, a = (book.bids[0] if book.bids else None), (book.asks[0] if book.asks else None)
         rows.append(
             {"ts_ns": ts, "venue": venue, "market_id": mkt,
@@ -47,7 +47,7 @@ async def run_burst(
 
     while now() < end:
         t = now()
-        await asyncio.gather(*(one(v, m, t) for v, m in markets))
+        await asyncio.gather(*(one(v, m) for v, m in markets))
         await sleep(max(0.0, every - (now() - t) / 1e9))
     if rows:
         store.write("bursts", rows, start, root)
@@ -66,14 +66,12 @@ def run(
         for n in venues
         if n in conf.venue and conf.venue[n].enabled
     }
-    cand = sorted((v, m) for v, m in top_candidates(root, 10_000) if v in ads)[:0]
     ranked = [(v, m) for v, m in _ordered(root) if v in ads][:top]
     if not ranked:
         print("no candidates: run a full scan first (it writes the ranking)")
         return 1
     rows = asyncio.run(run_burst(ads, ranked, seconds, every, root))
     print(f"burst: {len(rows)} samples over {len(ranked)} markets, every {every}s for {seconds}s")
-    del cand
     return 0
 
 
