@@ -54,12 +54,14 @@ def test_pm_us_program_and_closed_form(fake_client):
     a = make("pm_us", fake_client)
     p = asyncio.run(a.programs())[0]
     assert (p.target_size, p.discount, p.two_sided) == (7500, 0.3, False)
-    assert p.R_usd_hr == pytest.approx(36 / 24)  # daily_event, end null -> 24h (unverified)
+    assert p.R_usd_hr == pytest.approx(
+        36 / 24 / 3
+    )  # futures pool pro-rated over the event's 3 instruments
     b = asyncio.run(a.book(p.market_id))
     assert b.bids[0].price == 0.01 and b.asks[0].price == 0.02
     d, raw = a.scored_depth(p, "bid", b)
     assert d == pytest.approx(7500.0) and raw == pytest.approx(135973.36)  # target-capped; touch
-    c = 0.00005
+    c = 0.00002
     cf = a.s_star_closed_form(p, "bid", b, c)
     best = max(range(5000), key=lambda s: a.expected_reward(p, s, "bid", b) - c * s)
     assert cf == pytest.approx(best, abs=1.0)
@@ -202,7 +204,12 @@ def test_program_schedules_come_from_venue_times(fake_client):
     from bmm.scan.venues.common import iso_ns
 
     pm = asyncio.run(make("pm_us", fake_client).programs())[0]
-    assert pm.start_ns == iso_ns("2026-10-02T00:00:00Z") and pm.end_ns is None and pm.pool_usd == 36
+    assert (
+        pm.start_ns == iso_ns("2026-10-02T00:00:00Z")
+        and pm.end_ns is None
+        and pm.pool_usd == 12
+        and pm.pool_event_usd == 36
+    )
     assert reward_hours(pm, iso_ns("2026-10-04T00:00:00Z")) == pytest.approx(
         24.0
     )  # open-ended daily

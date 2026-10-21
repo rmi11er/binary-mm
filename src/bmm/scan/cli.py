@@ -24,6 +24,10 @@ def main(argv: list[str]) -> int:
     b.add_argument("--top", type=int, default=8)
     b.add_argument("--seconds", type=float, default=600.0)
     b.add_argument("--every", type=float, default=2.0)
+    fd = sub.add_parser("futures-depth", help="Polymarket US futures depth analysis (read-only)")
+    fd.add_argument("--top", type=int, default=20)
+    fd.add_argument("--worst", type=int, default=10)
+    fd.add_argument("--limit", type=int, default=None)
     rep = sub.add_parser("report")
     rep.add_argument("--date", default=None)
     rep.add_argument("--include-latency-game", action="store_true")
@@ -32,6 +36,10 @@ def main(argv: list[str]) -> int:
         from bmm.scan.runner import run
 
         return run(args.venues.split(","), args.once, args.interval, args.full, args.top)
+    if args.cmd == "futures-depth":
+        from bmm.scan.futures_depth import run as depth_run
+
+        return depth_run(args.top, args.worst, args.limit)
     if args.cmd == "burst":
         from bmm.scan.burst import run as run_burst
 

@@ -37,6 +37,13 @@ class Program:
     stream_windows: int = (
         0  # >= 3: one of a recurring series of short windows (see kalshi.programs)
     )
+    program_id: str = ""
+    period: str = ""  # venue period name, e.g. daily_event / day_of / live
+    event_key: str = ""  # futures: slug minus the instrument suffix
+    event_n: int = (
+        1  # instruments sharing the event pool (futures); pool_usd is pro-rated by 1/event_n
+    )
+    pool_event_usd: float = 0.0  # the pool as the venue API shows it on each market row
 
 
 @dataclass(frozen=True)
