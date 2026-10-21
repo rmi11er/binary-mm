@@ -10,3 +10,9 @@ __pycache__/
 .mypy_cache/
 config/live.toml
 .superpowers/
+
+.DS_Store
+# scratch run output
+l_*/
+latrun/
+reports/rewards_scan_*.md

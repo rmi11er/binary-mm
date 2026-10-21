@@ -53,7 +53,7 @@
 - [ ] **Step 1: Write the check first**
 
 ```bash
-git -C /Users/reamil/projects/binary-mm rev-parse --abbrev-ref HEAD   # expect: phase-0
+git rev-parse --abbrev-ref HEAD   # expect: phase-0
 git check-ignore -q .env && echo ".env ignored"                        # expect: .env ignored
 git ls-files | grep -cE '(^|/)\.env$'                                   # expect: 0
 ```
